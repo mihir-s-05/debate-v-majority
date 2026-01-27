@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import re
 import signal
+import hashlib
+import struct
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
@@ -62,9 +64,14 @@ def strip_thinking_from_messages(
 
 
 def strip_thinking_from_contexts(
-    contexts: list[list[dict[str, str]]]
+    contexts: list[list[dict[str, str]]],
+    *,
+    parallel_threshold: int = 32,
 ) -> tuple[list[list[dict[str, str]]], int]:
     """Strip thinking content from all contexts."""
+    if not contexts:
+        return [], 0
+
     result: list[list[dict[str, str]]] = []
     num_changed = 0
     for ctx in contexts:
@@ -107,11 +114,18 @@ def last_boxed_only_string(string: str) -> str | None:
 
 
 def remove_boxed(s: str) -> str | None:
-    """Remove \\boxed{} wrapper and return inner content."""
-    left = "\\boxed{"
-    if not s.startswith(left) or not s.endswith("}"):
+    """
+    Remove a \\boxed{...} or \\fbox{...} wrapper and return inner content.
+    Tolerates whitespace between the command and the opening brace (e.g. \\boxed {A}).
+    """
+    if not isinstance(s, str):
         return None
-    return s[len(left) : -1]
+    if not s.endswith("}"):
+        return None
+    m = re.match(r"^\\(?:boxed|fbox)\s*{", s)
+    if not m:
+        return None
+    return s[m.end() : -1]
 
 
 def parse_math(text: str) -> str | None:
@@ -169,7 +183,13 @@ def most_frequent_answer(answers: list[str | None] | None) -> str | None:
     """Return the most frequent answer, or None if no clear majority."""
     if not answers:
         return None
-    counts = Counter(answers)
+    # Ignore unparsable outputs when voting. Treating `None` as a normal category
+    # makes voting unnecessarily brittle (e.g., [None, None, "C"] would otherwise
+    # return None even though the model produced a valid answer).
+    filtered = [a for a in answers if a is not None]
+    if not filtered:
+        return None
+    counts = Counter(filtered)
     top_count = max(counts.values(), default=0)
     if top_count <= 1:
         return None
@@ -399,8 +419,112 @@ def kill_process_tree(pid: int) -> None:
 # =============================================================================
 
 
+def _hash_obj_for_cache(hasher: "hashlib._Hash", obj: Any) -> None:
+    """
+    Update `hasher` with a stable representation of `obj`.
+
+    This avoids keeping large prompt strings alive in cache keys while still
+    incorporating all message fields that may affect `apply_chat_template()`.
+    """
+
+    def _u(b: bytes) -> None:
+        hasher.update(b)
+        hasher.update(b"\0")
+
+    def _u_int(n: int) -> None:
+        # Use 64-bit packing when possible; fall back to decimal bytes.
+        try:
+            hasher.update(struct.pack("!q", int(n)))
+            hasher.update(b"\0")
+        except Exception:
+            _u(str(n).encode("utf-8"))
+
+    if obj is None:
+        _u(b"none")
+        return
+    if obj is True:
+        _u(b"true")
+        return
+    if obj is False:
+        _u(b"false")
+        return
+
+    if isinstance(obj, int):
+        _u(b"int")
+        _u_int(obj)
+        return
+    if isinstance(obj, float):
+        _u(b"float")
+        _u(repr(obj).encode("utf-8"))
+        return
+    if isinstance(obj, str):
+        _u(b"str")
+        # Avoid keeping large strings alive in the cache key, and avoid
+        # re-encoding big prompts on every cache lookup. Python string hashes
+        # are cached per object, so this is typically O(1) after first use.
+        _u_int(len(obj))
+        _u_int(hash(obj))
+        # Add small, stable-ish extra signal to reduce hash-collision risk.
+        prefix = obj[:64]
+        suffix = obj[-64:]
+        _u_int(hash(prefix))
+        _u_int(hash(suffix))
+        return
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        b = bytes(obj)
+        _u(b"bytes")
+        _u_int(len(b))
+        _u_int(hash(b))
+        return
+
+    if isinstance(obj, (list, tuple)):
+        _u(b"list" if isinstance(obj, list) else b"tuple")
+        _u_int(len(obj))
+        for item in obj:
+            _hash_obj_for_cache(hasher, item)
+        return
+
+    if isinstance(obj, dict):
+        _u(b"dict")
+        _u_int(len(obj))
+        # Sort keys for determinism (messages are expected to be dict-like).
+        items = list(obj.items())
+        items.sort(key=lambda kv: (repr(kv[0]), type(kv[0]).__qualname__))
+        for k, v in items:
+            _hash_obj_for_cache(hasher, k)
+            _hash_obj_for_cache(hasher, v)
+        return
+
+    # Fallback: incorporate type and a bounded repr to keep hashing safe.
+    _u(b"obj")
+    _u(f"{type(obj).__module__}.{type(obj).__qualname__}".encode("utf-8"))
+    try:
+        r = repr(obj)
+    except Exception:
+        r = f"<unreprable {type(obj).__qualname__}>"
+    if len(r) > 2048:
+        r = r[:2048] + "...(truncated)"
+    _u(r.encode("utf-8", errors="surrogatepass"))
+
+
+def _messages_cache_key(messages: list[dict[str, Any]]) -> tuple[int, int, str]:
+    """
+    Create a compact, stable cache key for chat messages.
+
+    Returns a tuple containing a version number, message count, and a digest.
+    """
+    hasher = hashlib.blake2b(digest_size=32)
+    hasher.update(b"messages_cache_key_v2\0")
+    _hash_obj_for_cache(hasher, messages)
+    return (2, len(messages), hasher.hexdigest())
+
+
 class PromptTokenCounter:
-    """Token counter for chat messages with lazy tokenizer loading."""
+    """Token counter for chat messages with lazy tokenizer loading and caching."""
+
+    # Class-level cache shared across instances (keyed by model_name + messages)
+    _token_cache: dict[tuple, int] = {}
+    _cache_max_size: int = 4096
 
     def __init__(self, model_name: str) -> None:
         self._model_name = model_name
@@ -415,29 +539,65 @@ class PromptTokenCounter:
         )
         return self._tokenizer
 
-    def count_chat_tokens(self, messages: list[dict[str, str]]) -> int:
-        """Exact token count for chat messages."""
+    def _cache_key(self, messages: list[dict[str, Any]]) -> tuple:
+        """Create a full cache key including model name."""
+        # Keep cache keys small and include template options that affect encoding.
+        add_generation_prompt = True
+        return (self._model_name, add_generation_prompt, _messages_cache_key(messages))
+
+    def _get_cached(self, key: tuple) -> int | None:
+        """Get cached token count if available."""
+        return self._token_cache.get(key)
+
+    def _set_cached(self, key: tuple, count: int) -> None:
+        """Cache token count with simple LRU-style eviction."""
+        # Simple eviction: clear half the cache when full
+        if len(self._token_cache) >= self._cache_max_size:
+            keys_to_remove = list(self._token_cache.keys())[: self._cache_max_size // 2]
+            for k in keys_to_remove:
+                self._token_cache.pop(k, None)
+        self._token_cache[key] = count
+
+    def count_chat_tokens(self, messages: list[dict[str, Any]]) -> int:
+        """Exact token count for chat messages (cached)."""
+        cache_key = self._cache_key(messages)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         tok = self._get_tokenizer()
         if hasattr(tok, "apply_chat_template"):
             ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
             try:
-                return int(len(ids))
+                count = int(len(ids))
             except TypeError:
-                return int(ids.shape[-1])
-        text = "\n".join((m.get("role", "") + ": " + m.get("content", "")) for m in messages)
-        return int(len(tok.encode(text)))
+                count = int(ids.shape[-1])
+        else:
+            text = "\n".join((str(m.get("role", "")) + ": " + str(m.get("content", ""))) for m in messages)
+            count = int(len(tok.encode(text)))
 
-    def estimate_prompt_tokens(self, messages: list[dict[str, str]], *, exact_if_large: int) -> int:
+        self._set_cached(cache_key, count)
+        return count
+
+    def estimate_prompt_tokens(self, messages: list[dict[str, Any]], *, exact_if_large: int) -> int:
         """
         Estimated token count - uses heuristic for small prompts, tokenizer for large.
         
         When approx >= exact_if_large, switches to exact tokenization to avoid
         underestimation near context limits (which can cause CUDA device asserts).
         """
-        text = "\n".join((m.get("role", "") + ": " + m.get("content", "")) for m in messages)
+        text = "\n".join(
+            (str(m.get("role", "")) + ": " + str(m.get("content", ""))) for m in messages
+        )
         approx = max(1, len(text) // 4)
         if approx < exact_if_large:
             return approx
+
+        # Check cache first before expensive tokenization
+        cache_key = self._cache_key(messages)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
 
         # Use exact token counting when near the limit to avoid underestimation
         # that could lead to position overflow and CUDA device-side asserts
@@ -449,11 +609,15 @@ class PromptTokenCounter:
         try:
             if hasattr(tok, "apply_chat_template"):
                 ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-                return int(len(ids))
+                count = int(len(ids))
+                self._set_cached(cache_key, count)
+                return count
         except Exception:
             pass
         try:
-            return int(len(tok.encode(text)))
+            count = int(len(tok.encode(text)))
+            self._set_cached(cache_key, count)
+            return count
         except Exception:
             # If all exact methods fail, add safety margin
             return int(approx * 1.2)

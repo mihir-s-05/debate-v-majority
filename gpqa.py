@@ -171,31 +171,90 @@ def parse_answer(text: str, task_info: dict[str, Any]) -> str | None:
     """
     Parse a model's response to extract the answer (letter or freeform).
     """
+    def _boxed_to_choice(s: str) -> str | None:
+        """
+        Map boxed content to A/B/C/D if it clearly encodes a choice.
+        Handles variants like:
+          - C
+          - c
+          - (C)
+          - \\text{c}
+          - \\mathrm{C}
+          - \\mathbf{D}
+        """
+        s0 = str(s).strip()
+        if not s0:
+            return None
+        # If we boxed another \\boxed{...}, unwrap once.
+        m = re.fullmatch(r"(?is)\\(?:boxed|fbox)\s*{\s*(.*?)\s*}", s0)
+        if m:
+            s0 = m.group(1).strip()
+
+        # Direct single-letter (optionally parenthesized)
+        m = re.fullmatch(r"(?i)\(?\s*([ABCD])\s*\)?", s0)
+        if m:
+            return m.group(1).upper()
+        # Common LaTeX wrappers
+        m = re.fullmatch(r"(?is)\s*\\(?:text|mathrm|mathbf)\s*{\s*\(?\s*([ABCD])\s*\)?\s*}\s*", s0)
+        if m:
+            return m.group(1).upper()
+        return None
+
+    # Prefer explicit boxed answers.
     parsed = parse_math(text)
     if parsed is not None:
+        boxed_choice = _boxed_to_choice(parsed)
+        if boxed_choice is not None:
+            return boxed_choice
         parsed_norm = normalize_freeform_string(parsed)
-        if parsed_norm is None:
-            return None
-        # If the model boxed a letter choice, canonicalize it
-        if parsed_norm in ("a", "b", "c", "d"):
+        if parsed_norm is not None and parsed_norm in ("a", "b", "c", "d"):
             return parsed_norm.upper()
         return parsed_norm
 
-    # Fallback: try to extract a final choice near the end
-    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
-    tail_lines = lines[-8:] if len(lines) > 8 else lines
-    tail = "\n".join(tail_lines)
+    # Fallback: try to extract a final choice from unboxed outputs.
+    # We search cue-based patterns across the whole completion (less brittle when the model states an
+    # answer and then continues), but still use a character tail for "last-line" heuristics.
+    t = str(text or "")
+    tail = t[-2400:] if len(t) > 2400 else t
 
     # Prefer explicit "answer/final" cues
-    m = re.search(r"(?i)\b(?:final\s+answer|answer)\b[^A-D]*\(?\s*([ABCD])\s*\)?\b", tail)
+    m = None
+    cue_pat = re.compile(
+        r"(?i)\b(?:final\s+answer|answer|final\s+choice|choice)\b[^A-D]{0,40}\(?\s*([ABCD])\s*\)?\b"
+    )
+    for m in cue_pat.finditer(t):
+        pass
     if m:
         return m.group(1).upper()
 
-    # Or a standalone final line like "(C)" or "C"
+    # "Option C" pattern
+    m = None
+    opt_pat = re.compile(r"(?i)\boption\s*([ABCD])\b")
+    for m in opt_pat.finditer(tail):
+        pass
+    if m:
+        return m.group(1).upper()
+
+    # Markdown-ish endings like "**Final Answer**: C" or "Final: (D)"
+    m = None
+    final_line_pat = re.compile(r"(?i)\bfinal\b[^A-D]{0,40}\(?\s*([ABCD])\s*\)?")
+    for m in final_line_pat.finditer(t):
+        pass
+    if m:
+        return m.group(1).upper()
+
+    # Or a standalone final line like "(C)" or "C".
+    tail_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
     last = tail_lines[-1] if tail_lines else ""
     m = re.fullmatch(r"(?i)\(?\s*([ABCD])\s*\)?", last)
     if m:
         return m.group(1).upper()
+
+    # Last resort: a standalone letter line in the last few lines of the tail.
+    for ln in reversed(tail_lines[-12:]):
+        m2 = re.fullmatch(r"(?i)\(?\s*([ABCD])\s*\)?", ln)
+        if m2:
+            return m2.group(1).upper()
 
     return None
 

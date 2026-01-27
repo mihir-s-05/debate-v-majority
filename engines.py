@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, Callable
 
 from .shared import (
     is_cuda_oom,
@@ -450,15 +450,24 @@ class BatchSizeCache:
     that larger batches may OOM (i.e., after an actual OOM). A previous small successful
     batch (e.g., single mode with only 50 prompts) should NOT cap later calls (e.g., majority
     mode with 250 prompts and --batch_size 256).
+    
+    Adaptive probing:
+    - Starts probing after MIN_PROBE_INTERVAL successes
+    - Probe interval decreases as more probes succeed (up to MAX_PROBE_INTERVAL)
+    - Probe step size increases after consecutive successful probes
+    - Tracks time since OOM to allow more aggressive recovery over time
     """
     _instance: "BatchSizeCache | None" = None
-    PROBE_INTERVAL: int = 5
+    MIN_PROBE_INTERVAL: int = 3  # Start probing sooner
+    MAX_PROBE_INTERVAL: int = 10  # Don't wait too long
 
     def __init__(self) -> None:
         # Only set when we hit an OOM-like failure and back off. When None, we start each
         # call at the caller-provided cap (or full size).
         self.safe_batch_size: int | None = None
         self.success_count: int = 0
+        self.consecutive_probe_successes: int = 0
+        self.oom_count: int = 0  # Total OOMs encountered
 
     @classmethod
     def get(cls) -> "BatchSizeCache":
@@ -471,17 +480,51 @@ class BatchSizeCache:
         # reflect a small workload, not a hardware limit.
         self.success_count += 1
 
+    def record_probe_success(self, new_safe_bs: int) -> None:
+        """Record a successful probe to a larger batch size."""
+        self.safe_batch_size = new_safe_bs
+        self.success_count = 0
+        self.consecutive_probe_successes += 1
+
     def record_oom(self, new_bs: int) -> None:
         self.safe_batch_size = new_bs
         self.success_count = 0
+        self.consecutive_probe_successes = 0
+        self.oom_count += 1
+
+    def _get_probe_interval(self) -> int:
+        """Get dynamic probe interval based on history."""
+        # After consecutive successful probes, reduce interval
+        if self.consecutive_probe_successes >= 3:
+            return self.MIN_PROBE_INTERVAL
+        if self.consecutive_probe_successes >= 1:
+            return self.MIN_PROBE_INTERVAL + 1
+        # After multiple OOMs, be more conservative
+        if self.oom_count >= 3:
+            return self.MAX_PROBE_INTERVAL
+        return self.MIN_PROBE_INTERVAL + 2
 
     def should_probe(self) -> bool:
-        return self.safe_batch_size is not None and self.success_count >= self.PROBE_INTERVAL
+        if self.safe_batch_size is None:
+            return False
+        return self.success_count >= self._get_probe_interval()
 
     def get_probe_bs(self, max_possible: int) -> int:
         if self.safe_batch_size is None:
             return max_possible
-        return min(max_possible, self.safe_batch_size + max(1, self.safe_batch_size // 4))
+        
+        # Adaptive step size: larger steps after consecutive successful probes
+        if self.consecutive_probe_successes >= 3:
+            # Aggressive: try 50% increase
+            step = max(1, self.safe_batch_size // 2)
+        elif self.consecutive_probe_successes >= 1:
+            # Moderate: 33% increase
+            step = max(1, self.safe_batch_size // 3)
+        else:
+            # Conservative: 25% increase
+            step = max(1, self.safe_batch_size // 4)
+        
+        return min(max_possible, self.safe_batch_size + step)
 
 
 # =============================================================================
@@ -610,8 +653,16 @@ class VLLMInferenceEngine:
         batch_size: int | None = None,
         *,
         sampling_kwargs: dict[str, Any] | None = None,
+        progress_callback: "Callable[[int], None] | None" = None,
     ) -> list[str]:
-        """Generate completions with OOM recovery."""
+        """Generate completions with OOM recovery.
+        
+        Args:
+            contexts: List of chat message contexts to generate from.
+            batch_size: Maximum batch size for inference.
+            sampling_kwargs: Optional sampling parameter overrides.
+            progress_callback: Optional callback called with number of completions after each batch.
+        """
         if self._llm is None:
             self.initialize()
         if not contexts:
@@ -621,6 +672,7 @@ class VLLMInferenceEngine:
             contexts=contexts,
             max_batch_size=batch_size,
             sampling_kwargs=sampling_kwargs,
+            progress_callback=progress_callback,
         )
 
     def _generate_with_oom_backoff(
@@ -628,6 +680,7 @@ class VLLMInferenceEngine:
         contexts: list[list[dict[str, str]]],
         max_batch_size: int | None = None,
         sampling_kwargs: dict[str, Any] | None = None,
+        progress_callback: "Callable[[int], None] | None" = None,
     ) -> list[str]:
         """Generate with dynamic batch sizing and OOM backoff."""
         import torch
@@ -694,21 +747,41 @@ class VLLMInferenceEngine:
 
         # Start at the caller-provided cap (or full size) unless we previously observed an OOM.
         current_bs = min(cache.safe_batch_size, max_possible) if cache.safe_batch_size else max_possible
+        is_probing = False
 
         while i < len(contexts):
             remaining = len(contexts) - i
+            
+            # Check if we should probe for a larger batch size
+            if cache.should_probe() and not is_probing:
+                probe_bs = cache.get_probe_bs(min(max_possible, remaining))
+                if probe_bs > current_bs:
+                    current_bs = probe_bs
+                    is_probing = True
+            
             current_bs = max(1, min(current_bs, remaining))
 
             batch_contexts = contexts[i : i + current_bs]
             try:
-                out.extend(_generate_chunk(batch_contexts))
-                cache.record_success(current_bs)
+                chunk_results = _generate_chunk(batch_contexts)
+                out.extend(chunk_results)
+                
+                # If this was a successful probe, record it specially
+                if is_probing and current_bs > (cache.safe_batch_size or 0):
+                    cache.record_probe_success(current_bs)
+                    is_probing = False
+                else:
+                    cache.record_success(current_bs)
+                
+                if progress_callback is not None:
+                    progress_callback(len(chunk_results))
             except Exception as e:
                 # Device-side asserts / illegal memory access can poison the CUDA context; restart vLLM.
                 if is_cuda_device_side_assert(e) or is_vllm_engine_dead(e):
                     _restart_with_safer_runtime(f"{type(e).__name__}: {e}")
                     # Retry the same chunk at a smaller batch size to reduce stress.
                     current_bs = max(1, current_bs // 2)
+                    is_probing = False
                     continue
                 if is_vllm_oom_like(e) and current_bs > 1:
                     gc.collect()
@@ -716,6 +789,7 @@ class VLLMInferenceEngine:
                     new_bs = max(1, current_bs // 2)
                     cache.record_oom(new_bs)
                     current_bs = new_bs
+                    is_probing = False
                     continue
                 raise
 
@@ -898,8 +972,10 @@ class AdaptiveVLLMEngine:
                 self._upgrade_to(target)
 
     def _maybe_strip_thinking_for_contexts(
-        self, contexts: list[list[dict[str, str]]]
-    ) -> tuple[list[list[dict[str, str]]], bool]:
+        self,
+        contexts: list[list[dict[str, str]]],
+        token_estimates: list[int] | None = None,
+    ) -> tuple[list[list[dict[str, str]]], bool, list[int] | None]:
         """
         Check if thinking content should be stripped and strip if needed.
         
@@ -907,30 +983,34 @@ class AdaptiveVLLMEngine:
         1. It hasn't been stripped yet, AND
         2. Any context exceeds THINKING_STRIP_THRESHOLD of the context limit
         
-        Returns (contexts, was_stripped_this_call).
+        Returns (contexts, was_stripped_this_call, token_estimates).
+        Token estimates are returned so callers can reuse them (None if stripping occurred).
         """
         if not contexts:
-            return contexts, False
+            return contexts, False, token_estimates
         
         # If already stripped, just apply stripping to any new content
         if self._thinking_stripped:
             stripped, num_changed = strip_thinking_from_contexts(contexts)
-            return stripped, False  # Not a new decision, just maintenance
+            # Invalidate estimates if content changed
+            return stripped, False, None if num_changed > 0 else token_estimates
         
         # Check if any context exceeds the threshold
         max_prompt_tokens = max(1, self._current_max_model_len - 128)
         strip_threshold = int(max_prompt_tokens * THINKING_STRIP_THRESHOLD)
         exact_if_large = int(strip_threshold * 0.75)
         
-        needs_strip = False
-        for ctx in contexts:
-            n_est = self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
-            if n_est >= strip_threshold:
-                needs_strip = True
-                break
+        # Compute token estimates if not provided
+        if token_estimates is None:
+            token_estimates = [
+                self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
+                for ctx in contexts
+            ]
+        
+        needs_strip = any(est >= strip_threshold for est in token_estimates)
         
         if not needs_strip:
-            return contexts, False
+            return contexts, False, token_estimates
         
         # Strip thinking from all contexts
         stripped, num_changed = strip_thinking_from_contexts(contexts)
@@ -941,24 +1021,39 @@ class AdaptiveVLLMEngine:
                 f"(threshold: {strip_threshold} tokens).",
                 file=sys.stderr,
             )
-        return stripped, num_changed > 0
+        # Invalidate estimates since content changed
+        return stripped, num_changed > 0, None
 
     def _truncate_contexts_to_fit(self, contexts: list[list[dict[str, str]]]) -> list[list[dict[str, str]]]:
         """Truncate contexts that exceed the current limit."""
         if not contexts:
             return contexts
 
-        # First, try stripping thinking content if we're approaching the limit
-        contexts, _ = self._maybe_strip_thinking_for_contexts(contexts)
-
         max_prompt_tokens = max(1, self._current_max_model_len - 128)
         near = int(max_prompt_tokens * 0.92)
         exact_if_large = int(near * 0.75)
 
+        # Compute token estimates once
+        token_estimates = [
+            self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
+            for ctx in contexts
+        ]
+
+        # Try stripping thinking content if we're approaching the limit, reuse estimates
+        contexts, did_strip, token_estimates = self._maybe_strip_thinking_for_contexts(
+            contexts, token_estimates
+        )
+
+        # Re-estimate only if stripping invalidated our estimates
+        if token_estimates is None:
+            token_estimates = [
+                self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
+                for ctx in contexts
+            ]
+
         out: list[list[dict[str, str]]] = []
         changed = 0
-        for ctx in contexts:
-            n_est = self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
+        for ctx, n_est in zip(contexts, token_estimates):
             if n_est <= max_prompt_tokens:
                 out.append(ctx)
                 continue
@@ -981,8 +1076,16 @@ class AdaptiveVLLMEngine:
         batch_size: int | None = None,
         *,
         sampling_kwargs: dict[str, Any] | None = None,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> list[str]:
-        """Generate with thinking stripping and truncation (no context upgrades)."""
+        """Generate with thinking stripping and truncation (no context upgrades).
+        
+        Args:
+            contexts: List of chat message contexts to generate from.
+            batch_size: Maximum batch size for inference.
+            sampling_kwargs: Optional sampling parameter overrides.
+            progress_callback: Optional callback called with number of completions after each batch.
+        """
         self.initialize()
         if not contexts:
             return []
@@ -992,13 +1095,19 @@ class AdaptiveVLLMEngine:
 
         assert self._engine is not None
         try:
-            return self._engine.generate_batch(contexts, batch_size=batch_size, sampling_kwargs=sampling_kwargs)
+            return self._engine.generate_batch(
+                contexts, batch_size=batch_size, sampling_kwargs=sampling_kwargs,
+                progress_callback=progress_callback,
+            )
         except Exception as e:
             if is_prompt_too_long(e):
                 # Try truncating again (more aggressively if needed)
                 truncated = self._truncate_contexts_to_fit(contexts)
                 if truncated != contexts:
-                    return self._engine.generate_batch(truncated, batch_size=batch_size, sampling_kwargs=sampling_kwargs)
+                    return self._engine.generate_batch(
+                        truncated, batch_size=batch_size, sampling_kwargs=sampling_kwargs,
+                        progress_callback=progress_callback,
+                    )
             raise
 
 

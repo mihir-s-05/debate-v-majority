@@ -25,8 +25,9 @@ from . import DatasetName, Mode
 
 class _DoubleCtrlCHandler:
     """
-    Require two Ctrl+C presses within a time window to actually exit.
-    Prevents accidental termination of long-running evaluations.
+    Require two Ctrl+C presses to interrupt.
+
+    The first Ctrl+C prints a warning; a second Ctrl+C within `timeout` seconds exits (code 130).
     """
 
     def __init__(self, timeout: float = 2.0, output_file: TextIO | None = None) -> None:
@@ -68,6 +69,7 @@ class _DoubleCtrlCHandler:
 from .shared import (
     most_frequent_answer,
     render_agent_assistant_rounds,
+    assistant_message_indexes,
     PromptTokenCounter,
     is_prompt_too_long,
     strip_thinking_content,
@@ -211,6 +213,32 @@ def _get_judge_prompt(dataset: DatasetName) -> dict[str, str]:
     """Get judge prompt configuration."""
     mod = _get_dataset_module(dataset)
     return mod.JUDGE_PROMPT
+
+
+def _parse_agent_round_answers(
+    *,
+    dataset: DatasetName,
+    agent_contexts: list[list[dict[str, str]]],
+    n_rounds: int,
+    raw_task: dict[str, Any],
+) -> list[list[str | None]]:
+    """
+    Parse each agent's assistant messages into per-round answers.
+
+    Returns answers[agent_idx][round_idx] for round_idx in [0, n_rounds).
+    """
+    out: list[list[str | None]] = []
+    for ctx in agent_contexts:
+        idxs = assistant_message_indexes(ctx)
+        seq: list[str | None] = []
+        for r in range(n_rounds):
+            if r >= len(idxs):
+                seq.append(None)
+                continue
+            text = ctx[idxs[r]].get("content", "")
+            seq.append(_parse_answer(dataset, text, raw_task))
+        out.append(seq)
+    return out
 
 
 # =============================================================================
@@ -480,8 +508,9 @@ def run_sampled(
         contexts_flat.extend([[{"role": "user", "content": question}] for _ in range(n_samples)])
 
     pbar = tqdm(total=len(contexts_flat), desc=mode_label, unit="call", file=progress_file)
-    completions_flat = engine.generate_batch(contexts_flat, batch_size=batch_size)
-    pbar.update(len(contexts_flat))
+    completions_flat = engine.generate_batch(
+        contexts_flat, batch_size=batch_size, progress_callback=pbar.update
+    )
     pbar.close()
 
     records: list[dict[str, Any]] = []
@@ -674,50 +703,71 @@ def run_debate(
         # If the judge output is unparsable, do NOT hard-crash the whole eval.
         # Instead: try stripping <think> blocks, retry judge once with a strict-format nudge,
         # and if it still fails, keep the judge answer as None (counts as wrong).
-        judged_answers: list[str | None] = []
+        judged_answers: list[str | None] = [None for _ in parsed_items]
         judge_retry_raw_outputs: list[str | None] = [None for _ in parsed_items]
         judge_parse_failed: list[bool] = [False for _ in parsed_items]
         judge_used_fallback: list[bool] = [False for _ in parsed_items]
 
+        # First pass: try parsing all outputs, identify which need retries
+        needs_retry_idxs: list[int] = []
         for q_idx, (raw_out, (item, question, gt_answer, raw_task)) in enumerate(zip(judge_raw_outputs, parsed_items)):
-            used_fallback = False
             judged = _parse_answer(dataset, raw_out, raw_task)
             if judged is None:
                 judged = _parse_answer(dataset, strip_thinking_content(str(raw_out)), raw_task)
                 if judged is not None:
-                    used_fallback = True
-
+                    judge_used_fallback[q_idx] = True
             if judged is None:
-                # Retry once with an explicit instruction to output ONLY the final boxed answer.
-                used_fallback = True
-                try:
-                    retry_ctx = list(judge_contexts[q_idx]) + [
-                        {
-                            "role": "user",
-                            "content": (
-                                "Your previous output was unparsable.\n"
-                                "Reply again and output ONLY the final answer in the required format (e.g., \\boxed{...}).\n"
-                                "Do not include any other text."
-                            ),
-                        }
-                    ]
-                    retry_sampling = dict(judge_sampling_kwargs or {})
-                    retry_sampling.setdefault("temperature", 0.0)
-                    retry_sampling.setdefault("top_p", 1.0)
-                    retry_sampling.setdefault("max_tokens", min(int(judge_max_new_tokens), 512))
-                    retry_out = judge_engine.generate_batch([retry_ctx], batch_size=1, sampling_kwargs=retry_sampling)[0]
-                    judge_retry_raw_outputs[q_idx] = str(retry_out)
+                needs_retry_idxs.append(q_idx)
+                judge_used_fallback[q_idx] = True
+            else:
+                judged_answers[q_idx] = judged
+
+        # Batch all retries together for efficiency
+        if needs_retry_idxs:
+            retry_sampling = dict(judge_sampling_kwargs or {})
+            retry_sampling.setdefault("temperature", 0.0)
+            retry_sampling.setdefault("top_p", 1.0)
+            retry_sampling.setdefault("max_tokens", min(int(judge_max_new_tokens), 512))
+
+            retry_contexts: list[list[dict[str, str]]] = []
+            for q_idx in needs_retry_idxs:
+                retry_ctx = list(judge_contexts[q_idx]) + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous output was unparsable.\n"
+                            "Reply again and output ONLY the final answer in the required format (e.g., \\boxed{...}).\n"
+                            "Do not include any other text."
+                        ),
+                    }
+                ]
+                retry_contexts.append(retry_ctx)
+
+            try:
+                retry_outputs = judge_engine.generate_batch(retry_contexts, batch_size=batch_size, sampling_kwargs=retry_sampling)
+            except Exception as e:
+                # If batch retry fails, mark all as errors
+                retry_outputs = [f"[retry_error] {type(e).__name__}: {e}" for _ in needs_retry_idxs]
+
+            # Process retry results
+            for i, q_idx in enumerate(needs_retry_idxs):
+                item, question, gt_answer, raw_task = parsed_items[q_idx]
+                retry_out = retry_outputs[i]
+                judge_retry_raw_outputs[q_idx] = str(retry_out)
+
+                if isinstance(retry_out, str) and retry_out.startswith("[retry_error]"):
+                    judged = None
+                else:
                     judged = _parse_answer(dataset, retry_out, raw_task)
                     if judged is None:
                         judged = _parse_answer(dataset, strip_thinking_content(str(retry_out)), raw_task)
-                except Exception as e:
-                    # Any retry failure should not kill the eval either.
-                    judge_retry_raw_outputs[q_idx] = f"[retry_error] {type(e).__name__}: {e}"
-                    judged = None
 
-            if judged is None:
+                judged_answers[q_idx] = judged
+
+        # Log parse failures
+        for q_idx, (item, question, gt_answer, raw_task) in enumerate(parsed_items):
+            if judged_answers[q_idx] is None:
                 judge_parse_failed[q_idx] = True
-                # Keep stderr noise low: one concise warning per failure.
                 try:
                     print(
                         f"[warn] Unparsable judge output after retry; marking wrong (judge_answer=None) for subset_id={item.subset_id} orig_id={item.orig_id} round={current_round_num}",
@@ -725,9 +775,6 @@ def run_debate(
                     )
                 except Exception:
                     pass
-
-            judge_used_fallback[q_idx] = used_fallback
-            judged_answers.append(judged)
 
         # Cache this block's judge output to condition the next block's judge.
         for q_idx, (raw_out, judged) in enumerate(zip(judge_raw_outputs, judged_answers)):
@@ -744,8 +791,16 @@ def run_debate(
         for q_idx, (item, question, gt_answer, raw_task) in enumerate(parsed_items):
             agent_contexts = all_contexts[q_idx]
             judged = judged_answers[q_idx]
-            final_turn_parsed = [_parse_answer(dataset, ctx[-1]["content"], raw_task) for ctx in agent_contexts]
-            final_majority_answer = most_frequent_answer(final_turn_parsed)
+            agent_round_parsed_answers = _parse_agent_round_answers(
+                dataset=dataset,
+                agent_contexts=agent_contexts,
+                n_rounds=current_round_num,
+                raw_task=raw_task,
+            )
+            final_round_answers = [
+                answers[-1] if answers else None for answers in agent_round_parsed_answers
+            ]
+            final_majority_answer = most_frequent_answer(final_round_answers)
             final_majority_correct = _check_answer_correctness(dataset, final_majority_answer, gt_answer)
 
             final_judge_answer = judged
@@ -762,6 +817,11 @@ def run_debate(
                 "judge_correct": final_judge_correct,
             }
 
+            # Only copy agent_contexts if more rounds will follow (to avoid mutation issues)
+            # On the final round, we can reference directly since no more changes will occur
+            is_final_round = current_round_num == n_rounds
+            agent_responses = agent_contexts if is_final_round else [ctx[:] for ctx in agent_contexts]
+
             results_by_round[current_round_num].append(
                 {
                     "mode": "debate",
@@ -772,7 +832,8 @@ def run_debate(
                     "raw_task": raw_task,
                     "n_agents": n_agents,
                     "n_rounds": current_round_num,
-                    "agent_responses": [ctx[:] for ctx in agent_contexts],
+                    "agent_responses": agent_responses,
+                    "agent_round_parsed_answers": agent_round_parsed_answers,
                     "final_majority_answer": final_majority_answer,
                     "final_majority_correct": final_majority_correct,
                     "judge_trace": judge_trace,
@@ -1121,7 +1182,7 @@ def main() -> None:
                     if mode == "single":
                         out_path = out_dir / f"single_{dataset_tag}_{run_tag}_{model_tag}.jsonl"
                     elif mode == "majority":
-                        out_path = out_dir / f"majority_{dataset_tag}_{run_tag}_{model_tag}.jsonl"
+                        out_path = out_dir / f"majority_{dataset_tag}_samples{args.majority_samples}_{run_tag}_{model_tag}.jsonl"
                     else:
                         assert results_by_round is not None
                         assert judge_rounds is not None

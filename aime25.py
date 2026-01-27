@@ -61,11 +61,45 @@ def parse_answer(text: str, task_info: dict[str, Any]) -> str | None:
     """
     parsed = parse_math(text)
     if parsed is not None:
-        return normalize_numeric_string(parsed)
-    # Fall back to a trailing number
-    text = re.sub(r"(\d),(\d)", r"\1\2", text)
-    matches = re.findall(r"-?\d+(?:\.\d+)?", text)
-    return normalize_numeric_string(matches[-1]) if matches else None
+        norm = normalize_numeric_string(parsed)
+        if norm is not None and re.fullmatch(r"-?\d+", norm):
+            try:
+                v = int(norm)
+                if 0 <= v <= 999:
+                    return norm
+            except Exception:
+                pass
+        # If the boxed content isn't a valid AIME integer in [0,999], fall back to
+        # tail heuristics rather than returning an out-of-range intermediate result.
+    # If no boxed answer is present, avoid grabbing large intermediate values
+    # (e.g. counts like 32768) by preferring 0-999 integers near the end.
+    text = re.sub(r"(\d),(\d)", r"\1\2", str(text))
+    tail = text[-4000:] if len(text) > 4000 else text
+    # Avoid mis-reading decimals like 0.418 as the integer 0 or 418.
+    int_token = r"(?<![\d.])-?\d{1,3}(?!\.\d)\b"
+
+    # Prefer numbers near explicit "final/answer" cues.
+    m = None
+    for m in re.finditer(rf"(?i)\b(?:final\s+answer|answer|final)\b[^0-9]{{0,40}}({int_token})", tail):
+        pass
+    if m:
+        try:
+            v = int(m.group(1))
+            if 0 <= v <= 999:
+                return normalize_numeric_string(str(v))
+        except Exception:
+            pass
+
+    # Last integer in [0,999] in the tail.
+    ints = re.findall(int_token, tail)
+    for s in reversed(ints):
+        try:
+            v = int(s)
+        except Exception:
+            continue
+        if 0 <= v <= 999:
+            return normalize_numeric_string(str(v))
+    return None
 
 
 # =============================================================================
