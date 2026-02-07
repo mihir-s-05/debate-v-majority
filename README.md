@@ -22,6 +22,22 @@ gsm8k.py / aime25.py / gpqa.py  # dataset loaders + answer checking
 data/        # dataset files (auto-downloaded if missing)
 ```
 
+## Setup
+
+Requires Python 3.10+ and a vLLM-compatible GPU environment.
+
+```bash
+pip install -r requirements.txt   # or: pip install vllm==0.13.0
+```
+
+**CUDA note:** The vLLM pip wheel bundles a CUDA 12 runtime (`libcudart.so.12`), but it isn't on the default library search path. If you see `ImportError: libcudart.so.12: cannot open shared object file`, add the bundled library to `LD_LIBRARY_PATH`:
+
+```bash
+export LD_LIBRARY_PATH="$HOME/venvs/ma/lib/python3.10/site-packages/nvidia/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Add this to your `~/.bashrc` to make it permanent.
+
 ## Usage
 
 ```bash
