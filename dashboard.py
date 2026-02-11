@@ -1086,6 +1086,72 @@ def page_debate_analysis(runs: list[RunData], filtered_df: pd.DataFrame):
             with st.expander(f"Questions that lost correct ({len(lost_questions)} total)", expanded=False):
                 st.dataframe(lost_questions[["dataset", "model", "orig_id", "first_correct_round"]], use_container_width=True)
 
+    # --- Round-level accuracy convergence (for runs with multiple judged rounds) ---
+    st.subheader("Debate Round Effectiveness")
+    st.markdown(
+        "If multiple debate rounds were judged, this shows how judge and majority "
+        "accuracy evolve with each additional round of debate."
+    )
+
+    # Collect runs that have different round numbers
+    round_acc_data = []
+    for rd in debate_runs:
+        for rec in rd.records:
+            answers = rec.get("agent_round_parsed_answers") or []
+            gt = rec.get("answer")
+            n_a = len(answers)
+            n_r = len(answers[0]) if answers else 0
+            for r in range(n_r):
+                # Majority of agents at round r
+                ra = [answers[a][r] for a in range(n_a) if r < len(answers[a])]
+                non_none = [a for a in ra if a is not None]
+                if non_none:
+                    counts = Counter(non_none)
+                    top_count = max(counts.values())
+                    top = [a for a, c in counts.items() if c == top_count]
+                    maj_ans = top[0] if len(top) == 1 else None
+                else:
+                    maj_ans = None
+                maj_correct = int(str(maj_ans) == str(gt)) if maj_ans is not None and gt is not None else 0
+                any_correct = int(any(str(a) == str(gt) for a in ra if a is not None))
+                round_acc_data.append({
+                    "dataset": rd.meta.dataset,
+                    "model": rd.meta.model_tag or "unknown",
+                    "round": r + 1,
+                    "majority_correct": maj_correct,
+                    "any_agent_correct": any_correct,
+                })
+
+    if round_acc_data:
+        radf = pd.DataFrame(round_acc_data)
+        ragg = radf.groupby(["dataset", "model", "round"]).agg(
+            majority_acc=("majority_correct", "mean"),
+            any_correct_rate=("any_agent_correct", "mean"),
+        ).reset_index()
+        ragg["label"] = ragg["dataset"] + " / " + ragg["model"]
+
+        fig_conv = go.Figure()
+        for lbl in ragg["label"].unique():
+            sub = ragg[ragg["label"] == lbl]
+            fig_conv.add_trace(go.Scatter(
+                x=sub["round"], y=sub["majority_acc"],
+                mode="lines+markers", name=f"{lbl} (majority)",
+                line=dict(dash="solid"),
+            ))
+            fig_conv.add_trace(go.Scatter(
+                x=sub["round"], y=sub["any_correct_rate"],
+                mode="lines+markers", name=f"{lbl} (any agent correct)",
+                line=dict(dash="dot"),
+            ))
+        fig_conv.update_layout(
+            title="Per-Round Majority Accuracy & Correct Agent Presence",
+            xaxis_title="Round", yaxis_title="Rate",
+            yaxis_tickformat=".0%", yaxis_range=[0, 1],
+        )
+        st.plotly_chart(fig_conv, use_container_width=True)
+
+    download_csv(debate_df, "debate_analysis_runs.csv")
+
 
 # ---------------------------------------------------------------------------
 # Page: Model Statistics
