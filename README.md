@@ -41,9 +41,25 @@ Add this to your `~/.bashrc` to make it permanent.
 ## Usage
 
 ```bash
-# Run majority voting with 5 samples on GSM8K
 python -m debug_majority_debate --dataset gsm8k --mode majority --n 5
 
-# Run 3-round debate on GPQA
 python -m debug_majority_debate --dataset gpqa --mode debate --rounds 3
 ```
+
+## Targeted Judge Repair
+
+Use `rejudge_targets.py` to fix specific debate rows (by `orig_id`) in existing JSONL result files.
+
+```bash
+python rejudge_targets.py \
+  --dataset gpqa \
+  --target "../results/gpqa_quick/debate_gpqa_agents3_r3_n448_seed1105751790_all_20260207_211326_Qwen_Qwen3-32B.jsonl:115" \
+  --target "../results/gpqa_quick/debate_gpqa_agents3_r3_n448_seed1105751790_all_20260207_211326_Qwen_Qwen3-32B.jsonl:281" \
+  --dry_run
+```
+
+Behavior:
+- reparses existing `judge_trace` outputs first
+- if still invalid, rebuilds judge context from `agent_responses` and reruns judge
+- uses the same retry prompt/sampling fallback as normal debate retry logic
+- rewrites only targeted rows in-place (creates `.bak.<timestamp>` backups unless `--no_backup`)
