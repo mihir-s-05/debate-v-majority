@@ -401,9 +401,12 @@ def _run_judge_with_retry(
     retry_sampling = dict(sampling_kwargs or {})
     retry_sampling["temperature"] = 0.0
     retry_sampling["top_p"] = 1.0
-    retry_sampling["max_tokens"] = min(int(judge_max_new_tokens), 512)
+    retry_sampling["max_tokens"] = int(judge_max_new_tokens)
 
-    retry_ctx = list(judge_context) + [{"role": "user", "content": JUDGE_RETRY_NUDGE}]
+    retry_ctx = list(judge_context) + [
+        {"role": "assistant", "content": raw_output_s},
+        {"role": "user", "content": JUDGE_RETRY_NUDGE},
+    ]
     try:
         retry_output = str(
             engine.generate_batch(

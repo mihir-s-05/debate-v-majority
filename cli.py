@@ -892,15 +892,13 @@ def run_debate(
             retry_sampling = dict(judge_sampling_kwargs or {})
             retry_sampling["temperature"] = 0.0
             retry_sampling["top_p"] = 1.0
-            retry_sampling["max_tokens"] = min(int(judge_max_new_tokens), 512)
+            retry_sampling["max_tokens"] = int(judge_max_new_tokens)
 
             retry_contexts: list[list[dict[str, str]]] = []
             for q_idx in needs_retry_idxs:
                 retry_ctx = list(judge_contexts[q_idx]) + [
-                    {
-                        "role": "user",
-                        "content": JUDGE_RETRY_NUDGE,
-                    }
+                    {"role": "assistant", "content": str(judge_raw_outputs[q_idx])},
+                    {"role": "user", "content": JUDGE_RETRY_NUDGE},
                 ]
                 retry_contexts.append(retry_ctx)
 

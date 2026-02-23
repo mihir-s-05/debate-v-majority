@@ -24,11 +24,16 @@ THINKING_STRIP_THRESHOLD = 0.85  # Strip thinking when context reaches this frac
 _THINKING_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+_UNCLOSED_THINKING_PATTERN = re.compile(r"<think>(?:(?!</think>).)*$", re.DOTALL | re.IGNORECASE)
+
+
 def strip_thinking_content(text: str) -> str:
-    """Remove <think>...</think> blocks."""
+    """Remove <think>...</think> blocks and unclosed <think> tails."""
     if not text:
         return text
-    return _THINKING_PATTERN.sub("", text).strip()
+    result = _THINKING_PATTERN.sub("", text)
+    result = _UNCLOSED_THINKING_PATTERN.sub("", result)
+    return result.strip()
 
 
 def has_thinking_content(text: str) -> bool:
