@@ -10,13 +10,14 @@ import argparse
 import json
 import os
 import random
+import re
 import signal
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, TextIO, cast
+from typing import Any, Iterable, Literal, TextIO, cast
 
 from tqdm import tqdm
 
@@ -39,11 +40,9 @@ class _DoubleCtrlCHandler:
     def _handler(self, signum: int, frame) -> None:
         now = time.monotonic()
         if self._last_sigint_time is not None and (now - self._last_sigint_time) < self.timeout:
-            # Second Ctrl+C within timeout - actually exit
             print("\nInterrupted.", file=self.output_file, flush=True)
-            sys.exit(130)  # Standard exit code for SIGINT
+            sys.exit(130)
         else:
-            # First Ctrl+C - warn and wait for confirmation
             self._last_sigint_time = now
             print(
                 f"\nPress Ctrl+C again within {self.timeout:.0f}s to cancel...",
@@ -56,7 +55,6 @@ class _DoubleCtrlCHandler:
         try:
             self._original_handler = signal.signal(signal.SIGINT, self._handler)
         except ValueError:
-            # Likely not running in the main thread; leave default handling intact.
             self._original_handler = None
         return self
 
@@ -78,6 +76,9 @@ from .shared import (
     PrevJudgeInfo,
     format_prev_judge_full,
     format_prev_judge_short,
+    normalize_freeform_string,
+    normalize_numeric_string,
+    parse_math,
 )
 from .engines import (
     InferenceEngine,
@@ -136,7 +137,6 @@ class _QuietOutput:
         if not self.enabled:
             return False
 
-        # Restore before propagating exceptions so tracebacks are visible.
         if self._saved_stdout_fd is not None:
             try:
                 os.dup2(self._saved_stdout_fd, 1)
@@ -165,10 +165,6 @@ class _QuietOutput:
         return False
 
 
-# =============================================================================
-# Dataset imports (lazy to avoid circular imports)
-# =============================================================================
-
 
 def _get_dataset_module(dataset: DatasetName):
     """Lazily import dataset-specific module."""
@@ -192,9 +188,19 @@ def _parse_question_answer(dataset: DatasetName, sample: dict[str, Any]) -> tupl
 
 
 def _parse_answer(dataset: DatasetName, text: str, raw_task: dict[str, Any]) -> str | None:
-    """Parse an answer from model response."""
+    """Parse an answer from model response.
+
+    Strips <think>…</think> blocks before parsing so that intermediate
+    reasoning tokens don't pollute the tail-heuristic fallback.
+    """
     mod = _get_dataset_module(dataset)
-    return mod.parse_answer(text, raw_task)
+    stripped = strip_thinking_content(text)
+    parsed = mod.parse_answer(stripped, raw_task)
+    if parsed is not None:
+        return parsed
+    if stripped != text:
+        return mod.parse_answer(text, raw_task)
+    return None
 
 
 def _check_answer_correctness(dataset: DatasetName, answer: Any, gt: Any) -> int:
@@ -240,10 +246,6 @@ def _parse_agent_round_answers(
         out.append(seq)
     return out
 
-
-# =============================================================================
-# Data utilities
-# =============================================================================
 
 
 @dataclass(frozen=True)
@@ -297,7 +299,6 @@ def _ensure_dataset_test_jsonl(dataset: DatasetName, test_path: Path) -> None:
     elif dataset == "aime25":
         ds = datasets.load_dataset("math-ai/aime25", split="test")
     elif dataset == "gpqa":
-        # GPQA is gated - try to load it
         try:
             cfgs = datasets.get_dataset_config_names("Idavidrein/gpqa")
             config = next((c for c in cfgs if "main" in c.lower() and "diamond" not in c.lower()), cfgs[0])
@@ -328,7 +329,6 @@ def _make_dataset_subset(
     all_rows = _read_jsonl(test_path)
     total = len(all_rows)
 
-    # Choose indices
     if ids:
         chosen = list(dict.fromkeys(ids))
     elif range_str:
@@ -365,10 +365,6 @@ def _make_dataset_subset(
     return items, meta
 
 
-# =============================================================================
-# Judge utilities
-# =============================================================================
-
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a judge agent. You are tasked with evaluating some responses from different agents to a given "
@@ -376,6 +372,171 @@ JUDGE_SYSTEM_PROMPT = (
     "select the answer from the agent that you think is the most accurate. Provide the final answer as "
     "prompted in the question.\n\n"
 )
+
+JUDGE_RETRY_NUDGE = (
+    "Your previous output was unparsable.\n"
+    "Reply again and output ONLY the final answer in the required format (e.g., \\boxed{...}).\n"
+    "Do not include any other text."
+)
+
+
+@dataclass(frozen=True)
+class JudgeParseResult:
+    """Judge parse outcome with provenance."""
+    answer: str | None
+    mode: Literal["strict", "recover", "none"]
+    source: str
+    strict_success: bool
+
+
+def _strict_parse_answer(dataset: DatasetName, text: str, raw_task: dict[str, Any]) -> str | None:
+    """
+    Strict parser used to decide whether judge output is valid without retry.
+    Strict mode intentionally avoids broad tail heuristics.
+    """
+    t = str(text or "")
+    parsed = parse_math(t)
+    if parsed is None:
+        return None
+
+    if dataset == "aime25":
+        norm = normalize_numeric_string(parsed)
+        if norm is None or not re.fullmatch(r"-?\d+", norm):
+            return None
+        try:
+            v = int(norm)
+        except Exception:
+            return None
+        return norm if 0 <= v <= 999 else None
+
+    if dataset == "gsm8k":
+        p = str(parsed).replace(",", "").strip()
+        return p if re.fullmatch(r"-?\d+(?:\.\d+)?", p) else None
+
+    if dataset == "gpqa":
+        s0 = str(parsed).strip()
+        if not s0:
+            return None
+        m = re.fullmatch(r"(?is)\\(?:boxed|fbox)\s*{\s*(.*?)\s*}", s0)
+        if m:
+            s0 = m.group(1).strip()
+        m = re.fullmatch(r"(?i)\(?\s*([ABCD])\s*\)?", s0)
+        if m:
+            return m.group(1).upper()
+        m = re.fullmatch(r"(?is)\s*\\(?:text|mathrm|mathbf)\s*{\s*\(?\s*([ABCD])\s*\)?\s*}\s*", s0)
+        if m:
+            return m.group(1).upper()
+        parsed_norm = normalize_freeform_string(parsed)
+        if parsed_norm is None:
+            return None
+        if parsed_norm in ("a", "b", "c", "d"):
+            return parsed_norm.upper()
+        return parsed_norm
+
+    return None
+
+
+def _recover_parse_answer(dataset: DatasetName, text: str, raw_task: dict[str, Any]) -> str | None:
+    """
+    Conservative recovery parser used before rerunning judge generation.
+    Unlike dataset-level parsing, this avoids brittle "last token" fallbacks.
+    """
+    t = str(text or "")
+    if not t.strip():
+        return None
+
+    if dataset == "aime25":
+        t = re.sub(r"(\d),(\d)", r"\1\2", t)
+        tail = t[-4000:] if len(t) > 4000 else t
+        int_token = r"(?<![\d.])-?\d{1,3}(?!\.\d)\b"
+        m = None
+        for m in re.finditer(rf"(?i)\b(?:final\s+answer|answer|final)\b[^0-9]{{0,40}}({int_token})", tail):
+            pass
+        if not m:
+            return None
+        try:
+            v = int(m.group(1))
+        except Exception:
+            return None
+        if 0 <= v <= 999:
+            return normalize_numeric_string(str(v))
+        return None
+
+    if dataset == "gsm8k":
+        t = re.sub(r"(\d),(\d)", r"\1\2", t)
+        tail = t[-4000:] if len(t) > 4000 else t
+        token = r"-?\d+(?:\.\d+)?"
+        m = None
+        for m in re.finditer(rf"(?i)\b(?:final\s+answer|answer|final)\b[^0-9-]{{0,40}}({token})", tail):
+            pass
+        return m.group(1) if m else None
+
+    if dataset == "gpqa":
+        tail = t[-2400:] if len(t) > 2400 else t
+        m = None
+        cue_pat = re.compile(
+            r"(?i)\b(?:final\s+answer|answer|final\s+choice|choice)\b[^A-D]{0,40}\(?\s*([ABCD])\s*\)?\b"
+        )
+        for m in cue_pat.finditer(t):
+            pass
+        if m:
+            return m.group(1).upper()
+
+        m = None
+        opt_pat = re.compile(r"(?i)\boption\s*([ABCD])\b")
+        for m in opt_pat.finditer(tail):
+            pass
+        if m:
+            return m.group(1).upper()
+
+        m = None
+        final_line_pat = re.compile(r"(?i)\bfinal\b[^A-D]{0,40}\(?\s*([ABCD])\s*\)?")
+        for m in final_line_pat.finditer(t):
+            pass
+        if m:
+            return m.group(1).upper()
+
+        return None
+
+    return None
+
+
+def _parse_judge_output(
+    *,
+    dataset: DatasetName,
+    text: Any,
+    raw_task: dict[str, Any],
+    source_prefix: str,
+    strict_enabled: bool = True,
+    recovery_enabled: bool = True,
+) -> JudgeParseResult:
+    """
+    Parse judge output with strict-first, recovery-second policy.
+    """
+    if text is None:
+        return JudgeParseResult(answer=None, mode="none", source="none", strict_success=False)
+
+    raw_text = str(text)
+    stripped = strip_thinking_content(raw_text)
+    variants = [("raw", raw_text)]
+    if stripped != raw_text:
+        variants.append(("stripped", stripped))
+
+    if strict_enabled:
+        for suffix, candidate in variants:
+            parsed = _strict_parse_answer(dataset, candidate, raw_task)
+            if parsed is not None:
+                src = f"{source_prefix}_strict" if suffix == "raw" else f"{source_prefix}_strict_stripped"
+                return JudgeParseResult(answer=parsed, mode="strict", source=src, strict_success=True)
+
+    if recovery_enabled:
+        for suffix, candidate in variants:
+            parsed = _recover_parse_answer(dataset, candidate, raw_task)
+            if parsed is not None:
+                src = f"{source_prefix}_recovery" if suffix == "raw" else f"{source_prefix}_recovery_stripped"
+                return JudgeParseResult(answer=parsed, mode="recover", source=src, strict_success=False)
+
+    return JudgeParseResult(answer=None, mode="none", source="none", strict_success=False)
 
 
 def _build_judge_context(
@@ -455,7 +616,6 @@ def _select_adaptive_judge_window(
     if end_round <= 0 or context_len_tokens <= 0:
         return 1, None
 
-    # Reserve space for generation + safety margin for tokenizer overhead
     budget = max(1, int(context_len_tokens) - max(0, int(max_new_tokens)) - 256)
 
     prev_options: list[str | None] = [None]
@@ -482,10 +642,6 @@ def _select_adaptive_judge_window(
 
     raise RuntimeError(f"Judge prompt does not fit within context_len_tokens={context_len_tokens}")
 
-
-# =============================================================================
-# Execution modes
-# =============================================================================
 
 
 def run_sampled(
@@ -549,17 +705,17 @@ def run_debate(
     batch_size: int | None,
     judge_block_size: int | None = None,
     judge_sampling_kwargs: dict[str, Any] | None = None,
+    judge_strict_final_only: bool = True,
+    judge_recovery_parse_enabled: bool = True,
     judge_engine: InferenceEngine | None = None,
     progress_file: TextIO = sys.stdout,
 ) -> dict[int, list[dict[str, Any]]]:
     """Run multi-agent debate mode (matching quick_gsm8k_vllm.py semantics)."""
-    # Pre-parse all items
     parsed_items: list[tuple[SubsetItem, str, Any, dict[str, Any]]] = []
     for item in items:
         question, gt_answer, raw_task = _parse_question_answer(dataset, item.raw_task)
         parsed_items.append((item, question, gt_answer, raw_task))
 
-    # Initialize contexts: all_contexts[question_idx][agent_idx]
     all_contexts: list[list[list[dict[str, str]]]] = [
         [[{"role": "user", "content": question}] for _ in range(n_agents)]
         for item, question, gt_answer, raw_task in parsed_items
@@ -571,7 +727,6 @@ def run_debate(
     results_by_round: dict[int, list[dict[str, Any]]] = {r: [] for r in judge_rounds}
 
     for round_idx in tqdm(range(n_rounds), desc="debate rounds", total=n_rounds, file=progress_file):
-        # Add debate prompts for rounds > 0
         if round_idx > 0:
             for q_idx in range(len(parsed_items)):
                 agent_contexts = all_contexts[q_idx]
@@ -580,24 +735,19 @@ def run_debate(
                     other_answers = [a for j, a in enumerate(last_answers) if j != agent_idx]
                     agent_ctx.append(_construct_debate_message(dataset, other_answers))
 
-        # Flatten all contexts for batch generation
         flat_contexts = [
             all_contexts[q_idx][agent_idx]
             for q_idx in range(len(parsed_items))
             for agent_idx in range(n_agents)
         ]
 
-        # Generate all completions
         flat_completions = engine.generate_batch(flat_contexts, batch_size=batch_size)
 
-        # Unflatten and append to contexts
         for q_idx in range(len(parsed_items)):
             for agent_idx in range(n_agents):
                 flat_idx = q_idx * n_agents + agent_idx
                 all_contexts[q_idx][agent_idx].append({"role": "assistant", "content": flat_completions[flat_idx]})
 
-        # If the engine has flagged thinking stripping (due to context pressure),
-        # strip thinking from all canonical contexts so subsequent rounds use stripped versions
         if hasattr(engine, "thinking_stripped") and engine.thinking_stripped:
             for q_idx in range(len(parsed_items)):
                 for agent_idx in range(n_agents):
@@ -613,17 +763,13 @@ def run_debate(
         used_start_rounds: list[int] = [1 for _ in parsed_items]
         used_prev_texts: list[str | None] = [None for _ in parsed_items]
 
-        # Determine judge context length (adaptive engines may upgrade mid-run).
         ctx_len = int(getattr(judge_engine, "context_len_tokens", 0) or 0) or (
             infer_native_context_len(getattr(judge_engine, "model_name", engine.model_name)) or 32768
         )
 
-        # Reserve space for judge generation based on actual max_tokens that will be used.
-        # This prevents position overflow when the judge generates a long response.
         if judge_sampling_kwargs and "max_tokens" in judge_sampling_kwargs:
             judge_max_new_tokens = int(judge_sampling_kwargs["max_tokens"])
         else:
-            # Fall back to engine's default sampling params
             from .engines import get_sampling_config
             sampling_cfg = get_sampling_config()
             judge_max_new_tokens = sampling_cfg.max_tokens or 4096
@@ -666,7 +812,6 @@ def run_debate(
         except Exception as e:
             if not is_prompt_too_long(e):
                 raise
-            # Fallback: judge per-question (batching can exceed limits even if each prompt fits).
             print(
                 "[warn] Judge prompt too long in batched evaluation; falling back to per-question judging.",
                 file=sys.stderr,
@@ -700,45 +845,61 @@ def run_debate(
                 judge_contexts.append(ctx_msgs)
                 judge_raw_outputs.append(out)
 
-        # If the judge output is unparsable, do NOT hard-crash the whole eval.
-        # Instead: try stripping <think> blocks, retry judge once with a strict-format nudge,
-        # and if it still fails, keep the judge answer as None (counts as wrong).
         judged_answers: list[str | None] = [None for _ in parsed_items]
         judge_retry_raw_outputs: list[str | None] = [None for _ in parsed_items]
         judge_parse_failed: list[bool] = [False for _ in parsed_items]
         judge_used_fallback: list[bool] = [False for _ in parsed_items]
+        judge_parse_mode: list[str] = ["none" for _ in parsed_items]
+        judge_parse_source: list[str] = ["none" for _ in parsed_items]
+        judge_retry_reason: list[str | None] = [None for _ in parsed_items]
+        judge_finish_state: list[str] = ["raw_pending" for _ in parsed_items]
+        judge_raw_had_strict_final: list[bool] = [False for _ in parsed_items]
+        judge_retry_had_strict_final: list[bool] = [False for _ in parsed_items]
+        allow_recovery_acceptance = bool(judge_recovery_parse_enabled and not judge_strict_final_only)
 
-        # First pass: try parsing all outputs, identify which need retries
         needs_retry_idxs: list[int] = []
         for q_idx, (raw_out, (item, question, gt_answer, raw_task)) in enumerate(zip(judge_raw_outputs, parsed_items)):
-            judged = _parse_answer(dataset, raw_out, raw_task)
-            if judged is None:
-                judged = _parse_answer(dataset, strip_thinking_content(str(raw_out)), raw_task)
-                if judged is not None:
-                    judge_used_fallback[q_idx] = True
-            if judged is None:
-                needs_retry_idxs.append(q_idx)
-                judge_used_fallback[q_idx] = True
-            else:
-                judged_answers[q_idx] = judged
+            raw_strict_probe = _parse_judge_output(
+                dataset=dataset,
+                text=raw_out,
+                raw_task=raw_task,
+                source_prefix="raw",
+                strict_enabled=True,
+                recovery_enabled=False,
+            )
+            judge_raw_had_strict_final[q_idx] = bool(raw_strict_probe.strict_success)
 
-        # Batch all retries together for efficiency
+            parsed = _parse_judge_output(
+                dataset=dataset,
+                text=raw_out,
+                raw_task=raw_task,
+                source_prefix="raw",
+                strict_enabled=True,
+                recovery_enabled=allow_recovery_acceptance,
+            )
+            if parsed.answer is None:
+                needs_retry_idxs.append(q_idx)
+                judge_retry_reason[q_idx] = "parse_none"
+                judge_finish_state[q_idx] = "retry_needed"
+            else:
+                judged_answers[q_idx] = parsed.answer
+                judge_parse_mode[q_idx] = parsed.mode
+                judge_parse_source[q_idx] = parsed.source
+                judge_used_fallback[q_idx] = parsed.mode == "recover"
+                judge_finish_state[q_idx] = "raw_parsed"
+
         if needs_retry_idxs:
             retry_sampling = dict(judge_sampling_kwargs or {})
-            retry_sampling.setdefault("temperature", 0.0)
-            retry_sampling.setdefault("top_p", 1.0)
-            retry_sampling.setdefault("max_tokens", min(int(judge_max_new_tokens), 512))
+            retry_sampling["temperature"] = 0.0
+            retry_sampling["top_p"] = 1.0
+            retry_sampling["max_tokens"] = min(int(judge_max_new_tokens), 512)
 
             retry_contexts: list[list[dict[str, str]]] = []
             for q_idx in needs_retry_idxs:
                 retry_ctx = list(judge_contexts[q_idx]) + [
                     {
                         "role": "user",
-                        "content": (
-                            "Your previous output was unparsable.\n"
-                            "Reply again and output ONLY the final answer in the required format (e.g., \\boxed{...}).\n"
-                            "Do not include any other text."
-                        ),
+                        "content": JUDGE_RETRY_NUDGE,
                     }
                 ]
                 retry_contexts.append(retry_ctx)
@@ -746,10 +907,8 @@ def run_debate(
             try:
                 retry_outputs = judge_engine.generate_batch(retry_contexts, batch_size=batch_size, sampling_kwargs=retry_sampling)
             except Exception as e:
-                # If batch retry fails, mark all as errors
                 retry_outputs = [f"[retry_error] {type(e).__name__}: {e}" for _ in needs_retry_idxs]
 
-            # Process retry results
             for i, q_idx in enumerate(needs_retry_idxs):
                 item, question, gt_answer, raw_task = parsed_items[q_idx]
                 retry_out = retry_outputs[i]
@@ -757,14 +916,37 @@ def run_debate(
 
                 if isinstance(retry_out, str) and retry_out.startswith("[retry_error]"):
                     judged = None
+                    judge_finish_state[q_idx] = "retry_error"
+                    judge_retry_reason[q_idx] = "retry_generation_error"
                 else:
-                    judged = _parse_answer(dataset, retry_out, raw_task)
-                    if judged is None:
-                        judged = _parse_answer(dataset, strip_thinking_content(str(retry_out)), raw_task)
+                    retry_strict_probe = _parse_judge_output(
+                        dataset=dataset,
+                        text=retry_out,
+                        raw_task=raw_task,
+                        source_prefix="retry",
+                        strict_enabled=True,
+                        recovery_enabled=False,
+                    )
+                    judge_retry_had_strict_final[q_idx] = bool(retry_strict_probe.strict_success)
+                    parsed_retry = _parse_judge_output(
+                        dataset=dataset,
+                        text=retry_out,
+                        raw_task=raw_task,
+                        source_prefix="retry",
+                        strict_enabled=True,
+                        recovery_enabled=allow_recovery_acceptance,
+                    )
+                    judged = parsed_retry.answer
+                    if judged is not None:
+                        judge_parse_mode[q_idx] = parsed_retry.mode
+                        judge_parse_source[q_idx] = parsed_retry.source
+                        judge_used_fallback[q_idx] = parsed_retry.mode == "recover"
+                        judge_finish_state[q_idx] = "retry_parsed"
+                    else:
+                        judge_finish_state[q_idx] = "retry_unparsed"
 
                 judged_answers[q_idx] = judged
 
-        # Log parse failures
         for q_idx, (item, question, gt_answer, raw_task) in enumerate(parsed_items):
             if judged_answers[q_idx] is None:
                 judge_parse_failed[q_idx] = True
@@ -776,16 +958,20 @@ def run_debate(
                 except Exception:
                     pass
 
-        # Cache this block's judge output to condition the next block's judge.
         for q_idx, (raw_out, judged) in enumerate(zip(judge_raw_outputs, judged_answers)):
-            # Only cache if we actually have a parsed judge answer (avoid poisoning future rounds).
-            if judged is None or judge_used_fallback[q_idx]:
+            if judged is None or judge_parse_mode[q_idx] != "strict":
                 continue
+            cache_raw_output = raw_out
+            if (
+                str(judge_parse_source[q_idx]).startswith("retry_")
+                and judge_retry_raw_outputs[q_idx] is not None
+            ):
+                cache_raw_output = judge_retry_raw_outputs[q_idx]
             prev_judge_by_q[q_idx] = PrevJudgeInfo(
                 start_round=int(used_start_rounds[q_idx]),
                 end_round=block_end,
                 parsed_answer=str(judged),
-                raw_output=str(raw_out),
+                raw_output=str(cache_raw_output),
             )
 
         for q_idx, (item, question, gt_answer, raw_task) in enumerate(parsed_items):
@@ -814,11 +1000,15 @@ def run_debate(
                 "judge_parsed_answer": judged,
                 "judge_parse_failed": bool(judge_parse_failed[q_idx]),
                 "judge_used_fallback": bool(judge_used_fallback[q_idx]),
+                "judge_parse_mode": judge_parse_mode[q_idx],
+                "judge_parse_source": judge_parse_source[q_idx],
+                "judge_retry_reason": judge_retry_reason[q_idx],
+                "judge_finish_state": judge_finish_state[q_idx],
+                "judge_raw_had_strict_final": bool(judge_raw_had_strict_final[q_idx]),
+                "judge_retry_had_strict_final": bool(judge_retry_had_strict_final[q_idx]),
                 "judge_correct": final_judge_correct,
             }
 
-            # Only copy agent_contexts if more rounds will follow (to avoid mutation issues)
-            # On the final round, we can reference directly since no more changes will occur
             is_final_round = current_round_num == n_rounds
             agent_responses = agent_contexts if is_final_round else [ctx[:] for ctx in agent_contexts]
 
@@ -847,10 +1037,6 @@ def run_debate(
     return results_by_round
 
 
-# =============================================================================
-# Output utilities
-# =============================================================================
-
 
 def _accuracy(rows: list[dict[str, Any]]) -> float:
     """Calculate accuracy."""
@@ -876,7 +1062,6 @@ def _model_tag(model_name: str) -> str:
 
 
 def _dataset_tag(dataset: DatasetName) -> str:
-    # Match quick_gsm8k_vllm.py naming.
     return "aime" if dataset == "aime25" else dataset
 
 
@@ -908,10 +1093,6 @@ def _default_out_dir(dataset: DatasetName) -> Path:
     return Path("/home/ubuntu/multi-agent-attack/results") / f"{dataset}_quick"
 
 
-# =============================================================================
-# Main CLI
-# =============================================================================
-
 
 def main() -> None:
     """Main CLI entry point."""
@@ -919,12 +1100,10 @@ def main() -> None:
         description="Run multi-agent debate, majority voting, or single-response inference on GSM8K/AIME25/GPQA."
     )
 
-    # Essential arguments
     ap.add_argument("--model_name", type=str, required=True, help="HuggingFace model ID.")
     ap.add_argument("--gpus", type=str, default="0", help="GPU IDs (comma-separated). Sets CUDA_VISIBLE_DEVICES.")
     ap.add_argument("--dataset", type=str, default="gsm8k", choices=["gsm8k", "aime25", "gpqa"], help="Dataset to evaluate on.")
 
-    # Subset selection
     ap.add_argument(
         "--all",
         action="store_true",
@@ -935,10 +1114,8 @@ def main() -> None:
     ap.add_argument("--subset_range", type=str, default=None, help="Range like '0:10' or '0-9'.")
     ap.add_argument("--subset_seed", type=int, default=None, help="Random seed for subset sampling.")
 
-    # Mode selection
     ap.add_argument("--mode", type=str, default="single,debate", help="Modes to run: single, majority, debate (comma-separated).")
 
-    # Debate configuration
     ap.add_argument("--n_agents", type=int, default=3, help="Number of agents for debate.")
     ap.add_argument("--n_rounds", type=int, default=3, help="Number of debate rounds.")
     ap.add_argument("--majority_samples", type=int, default=5, help="Samples for majority voting.")
@@ -954,13 +1131,37 @@ def main() -> None:
         default=None,
         help="Force a fixed judge block size (N rounds per judge prompt). If omitted, auto-selects the largest window that fits.",
     )
-    # Judge sampling overrides (optional). If unset, inherits main sampling params.
     ap.add_argument("--judge_max_tokens", type=int, default=None, help="Optional max new tokens for judge output.")
     ap.add_argument("--judge_temperature", type=float, default=None, help="Optional judge temperature.")
     ap.add_argument("--judge_top_p", type=float, default=None, help="Optional judge top_p.")
     ap.add_argument("--judge_top_k", type=int, default=None, help="Optional judge top_k.")
+    ap.add_argument(
+        "--judge_strict_final_only",
+        dest="judge_strict_final_only",
+        action="store_true",
+        default=True,
+        help="Require strict boxed final-answer parse before accepting judge output.",
+    )
+    ap.add_argument(
+        "--no_judge_strict_final_only",
+        dest="judge_strict_final_only",
+        action="store_false",
+        help="Disable strict-only acceptance of judge output.",
+    )
+    ap.add_argument(
+        "--judge_recovery_parse_enabled",
+        dest="judge_recovery_parse_enabled",
+        action="store_true",
+        default=True,
+        help="Enable conservative recovery parse before judge retry.",
+    )
+    ap.add_argument(
+        "--no_judge_recovery_parse_enabled",
+        dest="judge_recovery_parse_enabled",
+        action="store_false",
+        help="Disable conservative recovery parse before judge retry.",
+    )
 
-    # vLLM configuration
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization (0.0-1.0).")
     ap.add_argument(
         "--enable_yarn",
@@ -983,7 +1184,7 @@ def main() -> None:
         dest="context_len",
         type=int,
         default=None,
-        help=argparse.SUPPRESS,  # backwards-compatible alias
+        help=argparse.SUPPRESS,
     )
     ap.add_argument("--batch_size", type=int, default=None, help="Max batch size for inference (default: auto).")
 
@@ -994,7 +1195,6 @@ def main() -> None:
         help="Silence vLLM/CUDA/etc logs; keep only progress bars, output paths, and final summary.",
     )
 
-    # Output
     ap.add_argument("--out_dir", type=str, default=None, help="Output directory.")
     ap.add_argument("--tag", type=str, default=None, help="Optional tag for output files.")
 
@@ -1008,12 +1208,10 @@ def main() -> None:
             os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
             os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-        # Set up environment
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
         gpu_count = len([g.strip() for g in str(args.gpus).split(",") if g.strip()]) or 1
 
         def _auto_batch_size() -> int:
-            # Tuned for "many prompts queued" workloads; OOM backoff will reduce if needed.
             if gpu_count >= 8:
                 return 1024
             if gpu_count >= 4:
@@ -1024,7 +1222,6 @@ def main() -> None:
 
         batch_size = int(args.batch_size) if args.batch_size is not None else _auto_batch_size()
 
-        # Parse modes
         modes: list[Mode] = []
         for m in args.mode.split(","):
             m = m.strip().lower()
@@ -1038,7 +1235,6 @@ def main() -> None:
         dataset: DatasetName = cast(DatasetName, args.dataset)
         subset_seed = args.subset_seed if args.subset_seed is not None else random.SystemRandom().randint(0, 2**32 - 1)
 
-        # Parse subset IDs if provided
         ids = None
         subset_range = args.subset_range
         if args.subset_ids:
@@ -1048,7 +1244,6 @@ def main() -> None:
             else:
                 ids = [int(x.strip()) for x in sids.split(",") if x.strip()]
 
-        # Allow "all" in --subset_range too (and a dedicated --all flag)
         if args.all or args.subset_n == "all":
             subset_range = "all"
             ids = None
@@ -1056,10 +1251,8 @@ def main() -> None:
             subset_range = "all"
             ids = None
 
-        # Get test path
         test_path = _default_dataset_test_path(dataset)
 
-        # Create subset
         items, meta = _make_dataset_subset(
             dataset=dataset,
             test_path=test_path,
@@ -1071,17 +1264,14 @@ def main() -> None:
         if not args.quiet:
             print(f"[data] Subset: {len(items)} items from {dataset}", file=sys.stderr)
 
-        # Build sampling config from model
         sampling_config = build_sampling_config(args.model_name)
         set_sampling_config(sampling_config)
 
         engine: InferenceEngine | None = None
         results: dict[str, list[dict[str, Any]]] = {}
 
-        # Enable double Ctrl+C to cancel (prevents accidental termination)
         with _DoubleCtrlCHandler(timeout=2.0, output_file=status_file):
             try:
-                # Create inference engine
                 if not args.quiet:
                     print(f"[engine] Creating inference engine for {args.model_name}...", file=sys.stderr)
                 engine = create_inference_engine(
@@ -1093,11 +1283,9 @@ def main() -> None:
                     enforce_eager=bool(args.enforce_eager),
                 )
 
-                # Output directory
                 out_dir = Path(args.out_dir) if args.out_dir else _default_out_dir(dataset)
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                # Generate tags for output files (match quick_gsm8k_vllm.py)
                 ts = _timestamp_tag()
                 model_tag = _model_tag(args.model_name)
                 dataset_tag = _dataset_tag(dataset)
@@ -1163,6 +1351,8 @@ def main() -> None:
                             batch_size=batch_size,
                             judge_block_size=args.judge_block_size,
                             judge_sampling_kwargs=judge_sampling_kwargs,
+                            judge_strict_final_only=bool(args.judge_strict_final_only),
+                            judge_recovery_parse_enabled=bool(args.judge_recovery_parse_enabled),
                             progress_file=progress_file,
                         )
                         max_round = max(judge_rounds) if judge_rounds else args.n_rounds
@@ -1178,7 +1368,6 @@ def main() -> None:
                             file=sys.stderr,
                         )
 
-                    # Write results
                     if mode == "single":
                         out_path = out_dir / f"single_{dataset_tag}_{run_tag}_{model_tag}.jsonl"
                     elif mode == "majority":
@@ -1186,13 +1375,11 @@ def main() -> None:
                     else:
                         assert results_by_round is not None
                         assert judge_rounds is not None
-                        # If multiple judge rounds, write each round's file like quick_gsm8k_vllm.py.
                         if args.debate_judge_rounds is not None or (args.judge_block_size is not None and args.judge_block_size > 0):
                             for r in sorted(judge_rounds):
                                 out_path_r = out_dir / f"debate_{dataset_tag}_agents{args.n_agents}_r{r}_{run_tag}_{model_tag}.jsonl"
                                 _write_jsonl(out_path_r, results_by_round[r])
                                 print(f"[output] Written to {out_path_r}", file=status_file)
-                        # Always write the final judged round too (and keep out_path pointing at it).
                         final_r = args.n_rounds if args.debate_judge_rounds is None else max(judge_rounds)
                         out_path = out_dir / f"debate_{dataset_tag}_agents{args.n_agents}_r{final_r}_{run_tag}_{model_tag}.jsonl"
 
@@ -1203,7 +1390,6 @@ def main() -> None:
                 if engine is not None:
                     engine.shutdown()
 
-        # Summary
         print("\n=== Summary ===", file=status_file)
         for mode, records in results.items():
             acc = _accuracy(records)

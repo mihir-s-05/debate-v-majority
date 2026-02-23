@@ -59,7 +59,8 @@ python rejudge_targets.py \
 ```
 
 Behavior:
-- reparses existing `judge_trace` outputs first
-- if still invalid, rebuilds judge context from `agent_responses` and reruns judge
-- uses the same retry prompt/sampling fallback as normal debate retry logic
+- reparses existing `judge_trace` outputs first with strict boxed-final parsing, then conservative recovery parsing
+- reruns judge only when reparsing still cannot recover a valid answer
+- retry pass is deterministic (`temperature=0`, `top_p=1`, capped `max_tokens`) and uses the same nudge prompt as debate mode
+- writes parse provenance into `judge_trace` (`judge_parse_mode`, `judge_parse_source`, retry reason, strict-final flags)
 - rewrites only targeted rows in-place (creates `.bak.<timestamp>` backups unless `--no_backup`)

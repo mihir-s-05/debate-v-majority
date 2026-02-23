@@ -38,9 +38,10 @@ if __package__ in (None, ""):
 
 from . import DatasetName
 from .cli import (
+    JUDGE_RETRY_NUDGE,
     _build_judge_context,
     _check_answer_correctness,
-    _parse_answer,
+    _parse_judge_output,
 )
 from .engines import (
     SamplingConfig,
@@ -48,14 +49,7 @@ from .engines import (
     create_inference_engine,
     set_sampling_config,
 )
-from .shared import render_agent_assistant_rounds, strip_thinking_content
-
-
-JUDGE_RETRY_NUDGE = (
-    "Your previous output was unparsable.\n"
-    "Reply again and output ONLY the final answer in the required format (e.g., \\boxed{...}).\n"
-    "Do not include any other text."
-)
+from .shared import render_agent_assistant_rounds
 
 
 @dataclass(frozen=True)
@@ -72,6 +66,12 @@ class JudgeAttempt:
     parse_failed: bool
     used_fallback: bool
     retry_used: bool
+    parse_mode: str
+    parse_source: str
+    retry_reason: str | None
+    finish_state: str
+    raw_had_strict_final: bool
+    retry_had_strict_final: bool
     judge_context: list[dict[str, str]]
 
 
@@ -202,41 +202,115 @@ def _is_empty(v: Any) -> bool:
     return v is None or (isinstance(v, str) and not v.strip())
 
 
-def _parsed_from_text(dataset: DatasetName, text: Any, raw_task: dict[str, Any]) -> str | None:
-    if text is None:
-        return None
-    return _parse_answer(dataset, str(text), raw_task)
+def _parse_judge_text(
+    *,
+    dataset: DatasetName,
+    text: Any,
+    raw_task: dict[str, Any],
+    source_prefix: str,
+    strict_enabled: bool = True,
+    recovery_enabled: bool = True,
+):
+    return _parse_judge_output(
+        dataset=dataset,
+        text=text,
+        raw_task=raw_task,
+        source_prefix=source_prefix,
+        strict_enabled=strict_enabled,
+        recovery_enabled=recovery_enabled,
+    )
 
 
 def _stored_final_is_valid(row: dict[str, Any], *, dataset: DatasetName) -> bool:
     raw_task = cast(dict[str, Any], row.get("raw_task") or {})
+    jt = cast(dict[str, Any], row.get("judge_trace") or {})
     final_judge = row.get("final_judge_answer")
     if _is_empty(final_judge):
         return False
-    parsed = _parsed_from_text(dataset, final_judge, raw_task)
-    if parsed is None:
-        return False
-    return str(parsed) == str(final_judge)
+
+    mode = str(jt.get("judge_parse_mode") or "").strip().lower()
+    parse_failed = bool(jt.get("judge_parse_failed"))
+    if mode == "strict" and not parse_failed:
+        parsed_answer = jt.get("judge_parsed_answer")
+        if not _is_empty(parsed_answer) and str(parsed_answer) == str(final_judge):
+            return True
+
+    raw_out = jt.get("judge_raw_response")
+    retry_out = jt.get("judge_retry_raw_response")
+    for prefix, txt in (("raw", raw_out), ("retry", retry_out)):
+        parsed = _parse_judge_text(
+            dataset=dataset,
+            text=txt,
+            raw_task=raw_task,
+            source_prefix=prefix,
+            strict_enabled=True,
+            recovery_enabled=False,
+        )
+        if parsed.answer is not None and str(parsed.answer) == str(final_judge):
+            return True
+    return False
 
 
-def _try_reparse_existing(row: dict[str, Any], *, dataset: DatasetName) -> tuple[str | None, bool, str]:
+def _try_reparse_existing(
+    row: dict[str, Any], *, dataset: DatasetName
+) -> tuple[str | None, str, str, bool, bool]:
     raw_task = cast(dict[str, Any], row["raw_task"])
     jt = cast(dict[str, Any], row.get("judge_trace") or {})
     raw_out = jt.get("judge_raw_response")
     retry_out = jt.get("judge_retry_raw_response")
 
-    attempts: list[tuple[str, Any, bool]] = [
-        ("raw", raw_out, False),
-        ("raw_stripped", strip_thinking_content(str(raw_out)) if raw_out is not None else None, True),
-        ("retry", retry_out, True),
-        ("retry_stripped", strip_thinking_content(str(retry_out)) if retry_out is not None else None, True),
-    ]
+    raw_strict = _parse_judge_text(
+        dataset=dataset,
+        text=raw_out,
+        raw_task=raw_task,
+        source_prefix="raw",
+        strict_enabled=True,
+        recovery_enabled=False,
+    )
+    raw_had_strict = bool(raw_strict.strict_success)
+    parsed_raw = _parse_judge_text(
+        dataset=dataset,
+        text=raw_out,
+        raw_task=raw_task,
+        source_prefix="raw",
+        strict_enabled=True,
+        recovery_enabled=True,
+    )
+    if parsed_raw.answer is not None:
+        return parsed_raw.answer, parsed_raw.mode, parsed_raw.source, raw_had_strict, False
 
-    for label, txt, fallback in attempts:
-        parsed = _parsed_from_text(dataset, txt, raw_task)
-        if parsed is not None:
-            return parsed, fallback, label
-    return None, False, "none"
+    retry_had_strict = False
+    if retry_out is not None:
+        retry_strict = _parse_judge_text(
+            dataset=dataset,
+            text=retry_out,
+            raw_task=raw_task,
+            source_prefix="retry",
+            strict_enabled=True,
+            recovery_enabled=False,
+        )
+        retry_had_strict = bool(retry_strict.strict_success)
+        parsed_retry = _parse_judge_text(
+            dataset=dataset,
+            text=retry_out,
+            raw_task=raw_task,
+            source_prefix="retry",
+            strict_enabled=True,
+            recovery_enabled=True,
+        )
+        if parsed_retry.answer is not None:
+            return parsed_retry.answer, parsed_retry.mode, parsed_retry.source, raw_had_strict, retry_had_strict
+
+    return None, "none", "none", raw_had_strict, retry_had_strict
+
+
+def _needs_retry(row: dict[str, Any], *, dataset: DatasetName) -> bool:
+    jt = cast(dict[str, Any], row.get("judge_trace") or {})
+    if bool(jt.get("judge_parse_failed")):
+        return True
+    if str(jt.get("judge_parse_mode") or "").strip().lower() == "recover":
+        return True
+    return not _stored_final_is_valid(row, dataset=dataset)
 
 
 def _rebuild_judge_context(row: dict[str, Any], *, dataset: DatasetName) -> list[dict[str, str]]:
@@ -288,50 +362,107 @@ def _run_judge_with_retry(
         batch_size=batch_size,
         sampling_kwargs=sampling_kwargs,
     )[0]
+    raw_output_s = str(raw_output)
 
-    used_fallback = False
-    retry_used = False
-    judged = _parsed_from_text(dataset, raw_output, raw_task)
-    if judged is None:
-        judged = _parsed_from_text(dataset, strip_thinking_content(str(raw_output)), raw_task)
-        if judged is not None:
-            used_fallback = True
+    raw_strict = _parse_judge_text(
+        dataset=dataset,
+        text=raw_output_s,
+        raw_task=raw_task,
+        source_prefix="raw",
+        strict_enabled=True,
+        recovery_enabled=False,
+    )
+    raw_had_strict_final = bool(raw_strict.strict_success)
+    parsed_raw = _parse_judge_text(
+        dataset=dataset,
+        text=raw_output_s,
+        raw_task=raw_task,
+        source_prefix="raw",
+        strict_enabled=True,
+        recovery_enabled=True,
+    )
+    if parsed_raw.answer is not None:
+        return JudgeAttempt(
+            judged_answer=parsed_raw.answer,
+            raw_output=raw_output_s,
+            retry_output=None,
+            parse_failed=False,
+            used_fallback=(parsed_raw.mode == "recover"),
+            retry_used=False,
+            parse_mode=parsed_raw.mode,
+            parse_source=parsed_raw.source,
+            retry_reason=None,
+            finish_state="raw_parsed",
+            raw_had_strict_final=raw_had_strict_final,
+            retry_had_strict_final=False,
+            judge_context=judge_context,
+        )
 
-    retry_output: str | None = None
-    if judged is None:
-        used_fallback = True
-        retry_used = True
-        retry_sampling = dict(sampling_kwargs or {})
-        retry_sampling.setdefault("temperature", 0.0)
-        retry_sampling.setdefault("top_p", 1.0)
-        retry_sampling.setdefault("max_tokens", min(int(judge_max_new_tokens), 512))
+    retry_sampling = dict(sampling_kwargs or {})
+    retry_sampling["temperature"] = 0.0
+    retry_sampling["top_p"] = 1.0
+    retry_sampling["max_tokens"] = min(int(judge_max_new_tokens), 512)
 
-        retry_ctx = list(judge_context) + [{"role": "user", "content": JUDGE_RETRY_NUDGE}]
-        try:
-            retry_output = str(
-                engine.generate_batch(
-                    [retry_ctx],
-                    batch_size=batch_size,
-                    sampling_kwargs=retry_sampling,
-                )[0]
-            )
-        except Exception as e:
-            retry_output = f"[retry_error] {type(e).__name__}: {e}"
+    retry_ctx = list(judge_context) + [{"role": "user", "content": JUDGE_RETRY_NUDGE}]
+    try:
+        retry_output = str(
+            engine.generate_batch(
+                [retry_ctx],
+                batch_size=batch_size,
+                sampling_kwargs=retry_sampling,
+            )[0]
+        )
+    except Exception as e:
+        retry_output = f"[retry_error] {type(e).__name__}: {e}"
 
-        if retry_output.startswith("[retry_error]"):
-            judged = None
-        else:
-            judged = _parsed_from_text(dataset, retry_output, raw_task)
-            if judged is None:
-                judged = _parsed_from_text(dataset, strip_thinking_content(retry_output), raw_task)
+    if retry_output.startswith("[retry_error]"):
+        return JudgeAttempt(
+            judged_answer=None,
+            raw_output=raw_output_s,
+            retry_output=retry_output,
+            parse_failed=True,
+            used_fallback=False,
+            retry_used=True,
+            parse_mode="none",
+            parse_source="none",
+            retry_reason="retry_generation_error",
+            finish_state="retry_error",
+            raw_had_strict_final=raw_had_strict_final,
+            retry_had_strict_final=False,
+            judge_context=judge_context,
+        )
 
+    retry_strict = _parse_judge_text(
+        dataset=dataset,
+        text=retry_output,
+        raw_task=raw_task,
+        source_prefix="retry",
+        strict_enabled=True,
+        recovery_enabled=False,
+    )
+    retry_had_strict_final = bool(retry_strict.strict_success)
+    parsed_retry = _parse_judge_text(
+        dataset=dataset,
+        text=retry_output,
+        raw_task=raw_task,
+        source_prefix="retry",
+        strict_enabled=True,
+        recovery_enabled=True,
+    )
+    judged = parsed_retry.answer
     return JudgeAttempt(
         judged_answer=judged,
-        raw_output=str(raw_output),
+        raw_output=raw_output_s,
         retry_output=retry_output,
         parse_failed=(judged is None),
-        used_fallback=used_fallback,
-        retry_used=retry_used,
+        used_fallback=(parsed_retry.mode == "recover"),
+        retry_used=True,
+        parse_mode=parsed_retry.mode,
+        parse_source=parsed_retry.source,
+        retry_reason="parse_none",
+        finish_state="retry_parsed" if judged is not None else "retry_unparsed",
+        raw_had_strict_final=raw_had_strict_final,
+        retry_had_strict_final=retry_had_strict_final,
         judge_context=judge_context,
     )
 
@@ -343,6 +474,12 @@ def _apply_answer_update(
     judged_answer: str | None,
     parse_failed: bool,
     used_fallback: bool,
+    parse_mode: str,
+    parse_source: str,
+    retry_reason: str | None,
+    finish_state: str,
+    raw_had_strict_final: bool,
+    retry_had_strict_final: bool,
     judge_raw_output: str | None,
     judge_retry_output: str | None,
     judge_context: list[dict[str, str]] | None,
@@ -363,6 +500,12 @@ def _apply_answer_update(
     jt["judge_parsed_answer"] = judged_answer
     jt["judge_parse_failed"] = bool(parse_failed)
     jt["judge_used_fallback"] = bool(used_fallback)
+    jt["judge_parse_mode"] = str(parse_mode or "none")
+    jt["judge_parse_source"] = str(parse_source or "none")
+    jt["judge_retry_reason"] = retry_reason
+    jt["judge_finish_state"] = str(finish_state or "none")
+    jt["judge_raw_had_strict_final"] = bool(raw_had_strict_final)
+    jt["judge_retry_had_strict_final"] = bool(retry_had_strict_final)
     jt["judge_correct"] = int(final_judge_correct)
 
     row["final_judge_answer"] = judged_answer
@@ -414,7 +557,7 @@ def _process_target_row(
     before = row.get("final_judge_answer")
     jt = cast(dict[str, Any], row.get("judge_trace") or {})
 
-    stored_invalid = (not _stored_final_is_valid(row, dataset=dataset)) or bool(jt.get("judge_parse_failed"))
+    stored_invalid = _needs_retry(row, dataset=dataset)
     if not stored_invalid:
         return RowUpdateResult(
             path=path,
@@ -423,10 +566,12 @@ def _process_target_row(
             before=before,
             after=before,
             changed=False,
-            details="Stored final_judge_answer is already valid for current parser.",
+            details="Stored final_judge_answer is already strict-valid; no retry needed.",
         )
 
-    reparsed, used_fallback, src = _try_reparse_existing(row, dataset=dataset)
+    reparsed, parse_mode, parse_source, raw_had_strict_final, retry_had_strict_final = _try_reparse_existing(
+        row, dataset=dataset
+    )
     if reparsed is not None:
         row_before_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
         _apply_answer_update(
@@ -434,7 +579,13 @@ def _process_target_row(
             row=row,
             judged_answer=reparsed,
             parse_failed=False,
-            used_fallback=used_fallback,
+            used_fallback=(parse_mode == "recover"),
+            parse_mode=parse_mode,
+            parse_source=parse_source,
+            retry_reason=None,
+            finish_state="reparse_existing",
+            raw_had_strict_final=raw_had_strict_final,
+            retry_had_strict_final=retry_had_strict_final,
             judge_raw_output=None,
             judge_retry_output=None,
             judge_context=None,
@@ -449,7 +600,7 @@ def _process_target_row(
             before=before,
             after=after,
             changed=(row_before_update != row_after_update),
-            details=f"Recovered via existing judge output parse source={src}.",
+            details=f"Recovered via existing judge output parse mode={parse_mode} source={parse_source}.",
         )
 
     model_name = str(jt.get("judge_model") or "").strip()
@@ -471,6 +622,12 @@ def _process_target_row(
         judged_answer=attempt.judged_answer,
         parse_failed=attempt.parse_failed,
         used_fallback=attempt.used_fallback,
+        parse_mode=attempt.parse_mode,
+        parse_source=attempt.parse_source,
+        retry_reason=attempt.retry_reason,
+        finish_state=attempt.finish_state,
+        raw_had_strict_final=attempt.raw_had_strict_final,
+        retry_had_strict_final=attempt.retry_had_strict_final,
         judge_raw_output=attempt.raw_output,
         judge_retry_output=attempt.retry_output,
         judge_context=attempt.judge_context,
@@ -491,6 +648,7 @@ def _process_target_row(
         details=(
             "Reran judge with rebuilt context."
             + (" Retry was used." if attempt.retry_used else "")
+            + f" Parse mode={attempt.parse_mode} source={attempt.parse_source}."
             + (" Still unparsable after retry." if attempt.parse_failed else "")
         ),
     )
