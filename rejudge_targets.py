@@ -38,6 +38,7 @@ if __package__ in (None, ""):
 
 from . import DatasetName
 from .cli import (
+    JudgeParseResult,
     JUDGE_RETRY_NUDGE,
     _build_judge_context,
     _check_answer_correctness,
@@ -49,7 +50,52 @@ from .engines import (
     create_inference_engine,
     set_sampling_config,
 )
-from .shared import render_agent_assistant_rounds
+from .shared import (
+    PromptTokenCounter,
+    render_agent_assistant_rounds,
+    strip_thinking_content,
+)
+
+_JUDGE_EXTRACT_FINAL_NUDGE_BY_DATASET: dict[str, str] = {
+    "gpqa": (
+        "You are given prior judge output that may be verbose or truncated.\n"
+        "Output ONLY one final choice in this exact format: \\boxed{A} (one of A, B, C, D).\n"
+        "Do not output any other text."
+    ),
+    "aime25": (
+        "You are given prior judge output that may be verbose or truncated.\n"
+        "Output ONLY one final integer answer in this exact format: \\boxed{N} where N is an integer from 0 to 999.\n"
+        "Do not output any other text."
+    ),
+    "gsm8k": (
+        "You are given prior judge output that may be verbose or truncated.\n"
+        "Output ONLY one final numeric answer in this exact format: \\boxed{N} where N is a number.\n"
+        "Do not output any other text."
+    ),
+}
+JUDGE_EXTRACT_FINAL_NUDGE = _JUDGE_EXTRACT_FINAL_NUDGE_BY_DATASET["gpqa"]
+
+
+def _get_extract_nudge(dataset: DatasetName) -> str:
+    return _JUDGE_EXTRACT_FINAL_NUDGE_BY_DATASET.get(str(dataset), JUDGE_EXTRACT_FINAL_NUDGE)
+
+
+_RETRY_STRONGER_NUDGE_BY_DATASET: dict[str, str] = {
+    "gpqa": "\nReturn exactly one final choice in this format only: \\boxed{A}.",
+    "aime25": "\nReturn exactly one final integer answer in this format only: \\boxed{N} where N is 0..999.",
+    "gsm8k": "\nReturn exactly one final numeric answer in this format only: \\boxed{N}.",
+}
+
+RAW_ERROR_PREFIX = "raw_error"
+RETRY_ERROR_PREFIX = "retry_error"
+EXTRACT_ERROR_PREFIX = "extract_error"
+EXTRACT_SAMPLING_KWARGS = {"temperature": 0.0, "top_p": 1.0, "max_tokens": 512}
+
+
+def _get_retry_stronger_nudge(dataset: DatasetName) -> str:
+    return _RETRY_STRONGER_NUDGE_BY_DATASET.get(
+        str(dataset), _RETRY_STRONGER_NUDGE_BY_DATASET["gpqa"]
+    )
 
 
 @dataclass(frozen=True)
@@ -84,6 +130,29 @@ class RowUpdateResult:
     after: Any
     changed: bool
     details: str = ""
+
+
+@dataclass
+class RerunRequest:
+    path: Path
+    orig_id: int
+    row_idx: int
+    row: dict[str, Any]
+    before: Any
+    model_name: str
+
+
+@dataclass
+class PreparedRerunMeta:
+    req: RerunRequest
+    raw_task: dict[str, Any]
+    judge_context: list[dict[str, str]]
+
+
+@dataclass
+class RowPlan:
+    immediate_result: RowUpdateResult | None
+    rerun_request: RerunRequest | None
 
 
 class EngineManager:
@@ -169,6 +238,15 @@ class EngineManager:
         cfg = self._get_sampling_cfg(model_name)
         return int(cfg.max_tokens or 4096)
 
+    def context_len_tokens(self, model_name: str) -> int | None:
+        eng = self._engines.get(model_name)
+        if eng is not None and hasattr(eng, "context_len_tokens"):
+            return int(eng.context_len_tokens)
+        return self._context_len
+
+    def get_token_counter(self, model_name: str) -> PromptTokenCounter:
+        return PromptTokenCounter(model_name)
+
 
 def _parse_target(value: str) -> TargetSpec:
     s = str(value).strip()
@@ -211,7 +289,7 @@ def _parse_judge_text(
     strict_enabled: bool = True,
     recovery_enabled: bool = True,
 ):
-    return _parse_judge_output(
+    parsed = _parse_judge_output(
         dataset=dataset,
         text=text,
         raw_task=raw_task,
@@ -219,6 +297,41 @@ def _parse_judge_text(
         strict_enabled=strict_enabled,
         recovery_enabled=recovery_enabled,
     )
+    if parsed.answer is not None or not recovery_enabled or dataset != "gpqa":
+        return parsed
+
+    recovered = _recover_gpqa_reasoning_choice(text)
+    if recovered is None:
+        return parsed
+    return JudgeParseResult(
+        answer=recovered,
+        mode="recover",
+        source=f"{source_prefix}_reasoning_recovery",
+        strict_success=False,
+    )
+
+
+def _recover_gpqa_reasoning_choice(text: Any) -> str | None:
+    t = str(text or "")
+    if not t.strip():
+        return None
+
+    pats = [
+        re.compile(
+            r"(?i)\b(?:closest(?:\s+option)?(?:\s+is)?|go\s+with|choose|pick|select)\b"
+            r"[^A-D]{0,36}(?:option\s*)?\(?\s*([ABCD])\s*\)?"
+        ),
+        re.compile(
+            r"(?i)\b(?:matches?|corresponds?\s+to)\b[^A-D]{0,36}(?:option\s*)?\(?\s*([ABCD])\s*\)?"
+        ),
+    ]
+    for pat in pats:
+        m = None
+        for m in pat.finditer(t):
+            pass
+        if m:
+            return m.group(1).upper()
+    return None
 
 
 def _stored_final_is_valid(row: dict[str, Any], *, dataset: DatasetName) -> bool:
@@ -313,7 +426,31 @@ def _needs_retry(row: dict[str, Any], *, dataset: DatasetName) -> bool:
     return not _stored_final_is_valid(row, dataset=dataset)
 
 
-def _rebuild_judge_context(row: dict[str, Any], *, dataset: DatasetName) -> list[dict[str, str]]:
+def _strip_thinking_from_agent_responses(
+    agent_responses: list[list[dict[str, str]]],
+) -> list[list[dict[str, str]]]:
+    stripped: list[list[dict[str, str]]] = []
+    for ctx in agent_responses:
+        new_ctx: list[dict[str, str]] = []
+        for msg in ctx:
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                new_content = strip_thinking_content(content)
+                new_ctx.append({**msg, "content": new_content})
+            else:
+                new_ctx.append(msg)
+        stripped.append(new_ctx)
+    return stripped
+
+
+def _rebuild_judge_context(
+    row: dict[str, Any],
+    *,
+    dataset: DatasetName,
+    context_len_tokens: int | None = None,
+    max_new_tokens: int | None = None,
+    counter: PromptTokenCounter | None = None,
+) -> list[dict[str, str]]:
     question = str(row["question"])
     agent_responses = row["agent_responses"]
     if not isinstance(agent_responses, list) or not agent_responses:
@@ -327,147 +464,556 @@ def _rebuild_judge_context(row: dict[str, Any], *, dataset: DatasetName) -> list
         render_agent_assistant_rounds(agent_conv=ctx, start_round=1, end_round=n_rounds)
         for ctx in agent_responses
     ]
-    return _build_judge_context(
-        dataset=dataset,
-        question=question,
-        responses=transcripts,
-        previous_judge=None,
+    msgs = _build_judge_context(
+        dataset=dataset, question=question, responses=transcripts, previous_judge=None,
     )
 
+    if context_len_tokens and max_new_tokens and counter:
+        budget = max(1, int(context_len_tokens) - int(max_new_tokens) - 256)
+        try:
+            n_tokens = counter.count_chat_tokens(msgs)
+        except Exception:
+            n_tokens = int(counter.estimate_prompt_tokens(msgs, exact_if_large=1) * 1.1)
 
-def _run_judge_with_retry(
+        if n_tokens > budget:
+            stripped_responses = _strip_thinking_from_agent_responses(agent_responses)
+            transcripts = [
+                render_agent_assistant_rounds(agent_conv=ctx, start_round=1, end_round=n_rounds)
+                for ctx in stripped_responses
+            ]
+            msgs = _build_judge_context(
+                dataset=dataset, question=question, responses=transcripts, previous_judge=None,
+            )
+            try:
+                n_tokens_after = counter.count_chat_tokens(msgs)
+            except Exception:
+                n_tokens_after = int(counter.estimate_prompt_tokens(msgs, exact_if_large=1) * 1.1)
+            print(
+                f"  [adaptive] stripped thinking blocks from agent transcripts "
+                f"({n_tokens} -> {n_tokens_after} tokens, budget {budget})",
+                file=sys.stderr,
+            )
+
+    return msgs
+
+
+def _build_judge_attempt(
     *,
-    dataset: DatasetName,
-    row: dict[str, Any],
-    engine_mgr: EngineManager,
-    model_name: str,
-    batch_size: int | None,
+    judged_answer: str | None,
+    raw_output: str,
+    retry_output: str | None,
+    parse_failed: bool,
+    used_fallback: bool,
+    retry_used: bool,
+    parse_mode: str,
+    parse_source: str,
+    retry_reason: str | None,
+    finish_state: str,
+    raw_had_strict_final: bool,
+    retry_had_strict_final: bool,
+    judge_context: list[dict[str, str]],
 ) -> JudgeAttempt:
-    raw_task = cast(dict[str, Any], row["raw_task"])
-    try:
-        judge_context = _rebuild_judge_context(row, dataset=dataset)
-    except Exception:
-        jt = cast(dict[str, Any], row.get("judge_trace") or {})
-        stored_ctx = jt.get("judge_context")
-        if not isinstance(stored_ctx, list) or not stored_ctx:
-            raise
-        judge_context = cast(list[dict[str, str]], stored_ctx)
-
-    engine = engine_mgr.get_engine(model_name)
-    sampling_kwargs = engine_mgr.judge_sampling_kwargs(model_name)
-    judge_max_new_tokens = engine_mgr.judge_max_new_tokens(model_name, sampling_kwargs)
-
-    raw_output = engine.generate_batch(
-        [judge_context],
-        batch_size=batch_size,
-        sampling_kwargs=sampling_kwargs,
-    )[0]
-    raw_output_s = str(raw_output)
-
-    raw_strict = _parse_judge_text(
-        dataset=dataset,
-        text=raw_output_s,
-        raw_task=raw_task,
-        source_prefix="raw",
-        strict_enabled=True,
-        recovery_enabled=False,
-    )
-    raw_had_strict_final = bool(raw_strict.strict_success)
-    parsed_raw = _parse_judge_text(
-        dataset=dataset,
-        text=raw_output_s,
-        raw_task=raw_task,
-        source_prefix="raw",
-        strict_enabled=True,
-        recovery_enabled=True,
-    )
-    if parsed_raw.answer is not None:
-        return JudgeAttempt(
-            judged_answer=parsed_raw.answer,
-            raw_output=raw_output_s,
-            retry_output=None,
-            parse_failed=False,
-            used_fallback=(parsed_raw.mode == "recover"),
-            retry_used=False,
-            parse_mode=parsed_raw.mode,
-            parse_source=parsed_raw.source,
-            retry_reason=None,
-            finish_state="raw_parsed",
-            raw_had_strict_final=raw_had_strict_final,
-            retry_had_strict_final=False,
-            judge_context=judge_context,
-        )
-
-    retry_sampling = dict(sampling_kwargs or {})
-    retry_sampling["temperature"] = 0.0
-    retry_sampling["top_p"] = 1.0
-    retry_sampling["max_tokens"] = int(judge_max_new_tokens)
-
-    retry_ctx = list(judge_context) + [
-        {"role": "assistant", "content": raw_output_s},
-        {"role": "user", "content": JUDGE_RETRY_NUDGE},
-    ]
-    try:
-        retry_output = str(
-            engine.generate_batch(
-                [retry_ctx],
-                batch_size=batch_size,
-                sampling_kwargs=retry_sampling,
-            )[0]
-        )
-    except Exception as e:
-        retry_output = f"[retry_error] {type(e).__name__}: {e}"
-
-    if retry_output.startswith("[retry_error]"):
-        return JudgeAttempt(
-            judged_answer=None,
-            raw_output=raw_output_s,
-            retry_output=retry_output,
-            parse_failed=True,
-            used_fallback=False,
-            retry_used=True,
-            parse_mode="none",
-            parse_source="none",
-            retry_reason="retry_generation_error",
-            finish_state="retry_error",
-            raw_had_strict_final=raw_had_strict_final,
-            retry_had_strict_final=False,
-            judge_context=judge_context,
-        )
-
-    retry_strict = _parse_judge_text(
-        dataset=dataset,
-        text=retry_output,
-        raw_task=raw_task,
-        source_prefix="retry",
-        strict_enabled=True,
-        recovery_enabled=False,
-    )
-    retry_had_strict_final = bool(retry_strict.strict_success)
-    parsed_retry = _parse_judge_text(
-        dataset=dataset,
-        text=retry_output,
-        raw_task=raw_task,
-        source_prefix="retry",
-        strict_enabled=True,
-        recovery_enabled=True,
-    )
-    judged = parsed_retry.answer
     return JudgeAttempt(
-        judged_answer=judged,
-        raw_output=raw_output_s,
+        judged_answer=judged_answer,
+        raw_output=raw_output,
         retry_output=retry_output,
-        parse_failed=(judged is None),
-        used_fallback=(parsed_retry.mode == "recover"),
-        retry_used=True,
-        parse_mode=parsed_retry.mode,
-        parse_source=parsed_retry.source,
-        retry_reason="parse_none",
-        finish_state="retry_parsed" if judged is not None else "retry_unparsed",
+        parse_failed=parse_failed,
+        used_fallback=used_fallback,
+        retry_used=retry_used,
+        parse_mode=parse_mode,
+        parse_source=parse_source,
+        retry_reason=retry_reason,
+        finish_state=finish_state,
         raw_had_strict_final=raw_had_strict_final,
         retry_had_strict_final=retry_had_strict_final,
         judge_context=judge_context,
     )
+
+
+def _prepare_rerun_metas(
+    *,
+    dataset: DatasetName,
+    model_name: str,
+    model_reqs: list[RerunRequest],
+    engine_mgr: EngineManager,
+    judge_max_new_tokens: int,
+) -> list[PreparedRerunMeta]:
+    ctx_len = engine_mgr.context_len_tokens(model_name)
+    token_counter = engine_mgr.get_token_counter(model_name)
+    metas: list[PreparedRerunMeta] = []
+
+    for req in model_reqs:
+        raw_task = cast(dict[str, Any], req.row["raw_task"])
+        try:
+            judge_context = _rebuild_judge_context(
+                req.row,
+                dataset=dataset,
+                context_len_tokens=ctx_len,
+                max_new_tokens=judge_max_new_tokens,
+                counter=token_counter,
+            )
+        except Exception:
+            jt = cast(dict[str, Any], req.row.get("judge_trace") or {})
+            stored_ctx = jt.get("judge_context")
+            if not isinstance(stored_ctx, list) or not stored_ctx:
+                raise
+            judge_context = cast(list[dict[str, str]], stored_ctx)
+        metas.append(PreparedRerunMeta(req=req, raw_task=raw_task, judge_context=judge_context))
+
+    return metas
+
+
+def _build_retry_sampling_kwargs(
+    *,
+    sampling_kwargs: dict[str, Any] | None,
+    judge_max_new_tokens: int,
+) -> dict[str, Any]:
+    retry_sampling = dict(sampling_kwargs or {})
+    retry_sampling["temperature"] = 0.0
+    retry_sampling["top_p"] = 1.0
+    retry_sampling["max_tokens"] = int(judge_max_new_tokens)
+    return retry_sampling
+
+
+def _run_raw_pass_for_model(
+    *,
+    dataset: DatasetName,
+    metas: list[PreparedRerunMeta],
+    raw_outputs: list[str],
+    attempts: dict[tuple[Path, int], JudgeAttempt],
+) -> tuple[list[int], list[bool]]:
+    retry_pending: list[int] = []
+    retry_raw_had_strict: list[bool] = [False for _ in metas]
+
+    for i, (meta, raw_output_s) in enumerate(zip(metas, raw_outputs)):
+        req = meta.req
+        key = (req.path, req.orig_id)
+        if raw_output_s.startswith(f"[{RAW_ERROR_PREFIX}]"):
+            attempts[key] = _build_judge_attempt(
+                judged_answer=None,
+                raw_output=raw_output_s,
+                retry_output=None,
+                parse_failed=True,
+                used_fallback=False,
+                retry_used=False,
+                parse_mode="none",
+                parse_source="none",
+                retry_reason="raw_generation_error",
+                finish_state="raw_error",
+                raw_had_strict_final=False,
+                retry_had_strict_final=False,
+                judge_context=meta.judge_context,
+            )
+            continue
+
+        raw_strict = _parse_judge_text(
+            dataset=dataset,
+            text=raw_output_s,
+            raw_task=meta.raw_task,
+            source_prefix="raw",
+            strict_enabled=True,
+            recovery_enabled=False,
+        )
+        raw_had_strict_final = bool(raw_strict.strict_success)
+        retry_raw_had_strict[i] = raw_had_strict_final
+        parsed_raw = _parse_judge_text(
+            dataset=dataset,
+            text=raw_output_s,
+            raw_task=meta.raw_task,
+            source_prefix="raw",
+            strict_enabled=True,
+            recovery_enabled=True,
+        )
+        if parsed_raw.answer is not None:
+            attempts[key] = _build_judge_attempt(
+                judged_answer=parsed_raw.answer,
+                raw_output=raw_output_s,
+                retry_output=None,
+                parse_failed=False,
+                used_fallback=(parsed_raw.mode == "recover"),
+                retry_used=False,
+                parse_mode=parsed_raw.mode,
+                parse_source=parsed_raw.source,
+                retry_reason=None,
+                finish_state="raw_parsed",
+                raw_had_strict_final=raw_had_strict_final,
+                retry_had_strict_final=False,
+                judge_context=meta.judge_context,
+            )
+            continue
+
+        retry_pending.append(i)
+
+    return retry_pending, retry_raw_had_strict
+
+
+def _run_retry_passes_for_model(
+    *,
+    dataset: DatasetName,
+    engine: Any,
+    metas: list[PreparedRerunMeta],
+    raw_outputs: list[str],
+    retry_pending: list[int],
+    batch_size: int | None,
+    retry_sampling: dict[str, Any],
+) -> dict[int, str]:
+    retry_ctx1: list[list[dict[str, str]]] = []
+    idx1: list[int] = []
+    for i in retry_pending:
+        retry_ctx1.append(
+            list(metas[i].judge_context)
+            + [
+                {"role": "assistant", "content": raw_outputs[i]},
+                {"role": "user", "content": JUDGE_RETRY_NUDGE},
+            ]
+        )
+        idx1.append(i)
+
+    retry_out1 = _generate_batch_texts(
+        engine=engine,
+        contexts=retry_ctx1,
+        batch_size=batch_size,
+        sampling_kwargs=retry_sampling,
+        error_prefix=RETRY_ERROR_PREFIX,
+    )
+
+    retry_pending2: list[int] = []
+    retry_output_by_meta: dict[int, str] = {}
+    for i, out_s in zip(idx1, retry_out1):
+        retry_output_by_meta[i] = out_s
+        if out_s.startswith(f"[{RETRY_ERROR_PREFIX}]"):
+            continue
+        parsed_probe = _parse_judge_text(
+            dataset=dataset,
+            text=out_s,
+            raw_task=metas[i].raw_task,
+            source_prefix="retry",
+            strict_enabled=True,
+            recovery_enabled=True,
+        )
+        if parsed_probe.answer is None:
+            retry_pending2.append(i)
+
+    retry_ctx2: list[list[dict[str, str]]] = []
+    idx2: list[int] = []
+    for i in retry_pending2:
+        retry_ctx2.append(
+            list(metas[i].judge_context)
+            + [
+                {"role": "assistant", "content": raw_outputs[i]},
+                {
+                    "role": "user",
+                    "content": JUDGE_RETRY_NUDGE + _get_retry_stronger_nudge(dataset),
+                }
+            ]
+        )
+        idx2.append(i)
+
+    retry_out2 = _generate_batch_texts(
+        engine=engine,
+        contexts=retry_ctx2,
+        batch_size=batch_size,
+        sampling_kwargs=retry_sampling,
+        error_prefix=RETRY_ERROR_PREFIX,
+    )
+    for i, out_s in zip(idx2, retry_out2):
+        retry_output_by_meta[i] = out_s
+    return retry_output_by_meta
+
+
+def _finalize_retry_pass_for_model(
+    *,
+    dataset: DatasetName,
+    metas: list[PreparedRerunMeta],
+    raw_outputs: list[str],
+    retry_pending: list[int],
+    retry_output_by_meta: dict[int, str],
+    retry_raw_had_strict: list[bool],
+    attempts: dict[tuple[Path, int], JudgeAttempt],
+) -> list[int]:
+    extract_pending: list[int] = []
+    for i in retry_pending:
+        meta = metas[i]
+        req = meta.req
+        key = (req.path, req.orig_id)
+        raw_output_s = raw_outputs[i]
+        retry_output = retry_output_by_meta.get(i) or f"[{RETRY_ERROR_PREFIX}] unknown"
+
+        if retry_output.startswith(f"[{RETRY_ERROR_PREFIX}]"):
+            attempts[key] = _build_judge_attempt(
+                judged_answer=None,
+                raw_output=raw_output_s,
+                retry_output=retry_output,
+                parse_failed=True,
+                used_fallback=False,
+                retry_used=True,
+                parse_mode="none",
+                parse_source="none",
+                retry_reason="retry_generation_error",
+                finish_state="retry_error",
+                raw_had_strict_final=retry_raw_had_strict[i],
+                retry_had_strict_final=False,
+                judge_context=meta.judge_context,
+            )
+            continue
+
+        retry_strict = _parse_judge_text(
+            dataset=dataset,
+            text=retry_output,
+            raw_task=meta.raw_task,
+            source_prefix="retry",
+            strict_enabled=True,
+            recovery_enabled=False,
+        )
+        retry_had_strict_final = bool(retry_strict.strict_success)
+        parsed_retry = _parse_judge_text(
+            dataset=dataset,
+            text=retry_output,
+            raw_task=meta.raw_task,
+            source_prefix="retry",
+            strict_enabled=True,
+            recovery_enabled=True,
+        )
+        judged = parsed_retry.answer
+        if judged is None:
+            extract_pending.append(i)
+            continue
+
+        attempts[key] = _build_judge_attempt(
+            judged_answer=judged,
+            raw_output=raw_output_s,
+            retry_output=retry_output,
+            parse_failed=False,
+            used_fallback=(parsed_retry.mode == "recover"),
+            retry_used=True,
+            parse_mode=parsed_retry.mode,
+            parse_source=parsed_retry.source,
+            retry_reason="parse_none",
+            finish_state="retry_parsed",
+            raw_had_strict_final=retry_raw_had_strict[i],
+            retry_had_strict_final=retry_had_strict_final,
+            judge_context=meta.judge_context,
+        )
+
+    return extract_pending
+
+
+def _finalize_extract_pass_for_model(
+    *,
+    dataset: DatasetName,
+    engine: Any,
+    metas: list[PreparedRerunMeta],
+    raw_outputs: list[str],
+    extract_pending: list[int],
+    retry_output_by_meta: dict[int, str],
+    retry_raw_had_strict: list[bool],
+    batch_size: int | None,
+    attempts: dict[tuple[Path, int], JudgeAttempt],
+) -> None:
+    extract_ctxs: list[list[dict[str, str]]] = []
+    extract_idx: list[int] = []
+    for i in extract_pending:
+        raw_output_s = raw_outputs[i]
+        retry_output = retry_output_by_meta.get(i) or ""
+        extract_ctxs.append(_build_extract_context(raw_output=raw_output_s, retry_output=retry_output, dataset=dataset))
+        extract_idx.append(i)
+
+    extract_out = _generate_batch_texts(
+        engine=engine,
+        contexts=extract_ctxs,
+        batch_size=batch_size,
+        sampling_kwargs=dict(EXTRACT_SAMPLING_KWARGS),
+        error_prefix=EXTRACT_ERROR_PREFIX,
+    )
+
+    for i, out_s in zip(extract_idx, extract_out):
+        meta = metas[i]
+        req = meta.req
+        key = (req.path, req.orig_id)
+        raw_output_s = raw_outputs[i]
+        retry_output = retry_output_by_meta.get(i) or ""
+        if out_s.startswith(f"[{EXTRACT_ERROR_PREFIX}]"):
+            attempts[key] = _build_judge_attempt(
+                judged_answer=None,
+                raw_output=raw_output_s,
+                retry_output=retry_output,
+                parse_failed=True,
+                used_fallback=False,
+                retry_used=True,
+                parse_mode="none",
+                parse_source="none",
+                retry_reason="parse_none",
+                finish_state="retry_unparsed",
+                raw_had_strict_final=retry_raw_had_strict[i],
+                retry_had_strict_final=False,
+                judge_context=meta.judge_context,
+            )
+            continue
+
+        parsed_extract = _parse_judge_text(
+            dataset=dataset,
+            text=out_s,
+            raw_task=meta.raw_task,
+            source_prefix="extract",
+            strict_enabled=True,
+            recovery_enabled=True,
+        )
+        if parsed_extract.answer is None:
+            attempts[key] = _build_judge_attempt(
+                judged_answer=None,
+                raw_output=raw_output_s,
+                retry_output=retry_output,
+                parse_failed=True,
+                used_fallback=False,
+                retry_used=True,
+                parse_mode="none",
+                parse_source="none",
+                retry_reason="parse_none",
+                finish_state="retry_unparsed",
+                raw_had_strict_final=retry_raw_had_strict[i],
+                retry_had_strict_final=False,
+                judge_context=meta.judge_context,
+            )
+            continue
+
+        attempts[key] = _build_judge_attempt(
+            judged_answer=parsed_extract.answer,
+            raw_output=raw_output_s,
+            retry_output=retry_output,
+            parse_failed=False,
+            used_fallback=(parsed_extract.mode == "recover"),
+            retry_used=True,
+            parse_mode=parsed_extract.mode,
+            parse_source=parsed_extract.source,
+            retry_reason="parse_none_then_extract",
+            finish_state="extract_parsed",
+            raw_had_strict_final=retry_raw_had_strict[i],
+            retry_had_strict_final=False,
+            judge_context=meta.judge_context,
+        )
+
+
+def _build_extract_context(
+    *, raw_output: str, retry_output: str | None, dataset: DatasetName | None = None,
+) -> list[dict[str, str]]:
+    chunks = [str(raw_output or "")]
+    if retry_output:
+        chunks.append(str(retry_output))
+    payload = "\n\n---\n\n".join(chunks)
+    nudge = _get_extract_nudge(dataset) if dataset else JUDGE_EXTRACT_FINAL_NUDGE
+    system_desc = (
+        "You extract a final answer."
+        if dataset and str(dataset) != "gpqa"
+        else "You extract a final multiple-choice answer."
+    )
+    return [
+        {"role": "system", "content": system_desc},
+        {"role": "user", "content": nudge + "\n\nPrior judge output:\n" + payload},
+    ]
+
+
+def _generate_batch_texts(
+    *,
+    engine: Any,
+    contexts: list[list[dict[str, str]]],
+    batch_size: int | None,
+    sampling_kwargs: dict[str, Any] | None,
+    error_prefix: str,
+) -> list[str]:
+    if not contexts:
+        return []
+    try:
+        return [str(x) for x in engine.generate_batch(contexts, batch_size=batch_size, sampling_kwargs=sampling_kwargs)]
+    except Exception as e:
+        err = f"[{error_prefix}] {type(e).__name__}: {e}"
+        out: list[str] = []
+        for ctx in contexts:
+            try:
+                txt = engine.generate_batch(
+                    [ctx],
+                    batch_size=1,
+                    sampling_kwargs=sampling_kwargs,
+                )[0]
+                out.append(str(txt))
+            except Exception as e2:
+                out.append(f"[{error_prefix}] {type(e2).__name__}: {e2}")
+        if not out:
+            out.append(err)
+        return out
+
+
+def _run_judge_with_retry_batched(
+    *,
+    dataset: DatasetName,
+    requests: list[RerunRequest],
+    engine_mgr: EngineManager,
+    batch_size: int | None,
+) -> dict[tuple[Path, int], JudgeAttempt]:
+    attempts: dict[tuple[Path, int], JudgeAttempt] = {}
+    by_model: dict[str, list[RerunRequest]] = {}
+    for req in requests:
+        by_model.setdefault(req.model_name, []).append(req)
+
+    for model_name, model_reqs in by_model.items():
+        engine = engine_mgr.get_engine(model_name)
+        sampling_kwargs = engine_mgr.judge_sampling_kwargs(model_name)
+        judge_max_new_tokens = engine_mgr.judge_max_new_tokens(model_name, sampling_kwargs)
+        metas = _prepare_rerun_metas(
+            dataset=dataset,
+            model_name=model_name,
+            model_reqs=model_reqs,
+            engine_mgr=engine_mgr,
+            judge_max_new_tokens=judge_max_new_tokens,
+        )
+        raw_contexts = [m.judge_context for m in metas]
+        raw_outputs = _generate_batch_texts(
+            engine=engine,
+            contexts=raw_contexts,
+            batch_size=batch_size,
+            sampling_kwargs=sampling_kwargs,
+            error_prefix=RAW_ERROR_PREFIX,
+        )
+        retry_sampling = _build_retry_sampling_kwargs(
+            sampling_kwargs=sampling_kwargs,
+            judge_max_new_tokens=judge_max_new_tokens,
+        )
+        retry_pending, retry_raw_had_strict = _run_raw_pass_for_model(
+            dataset=dataset,
+            metas=metas,
+            raw_outputs=raw_outputs,
+            attempts=attempts,
+        )
+        retry_output_by_meta = _run_retry_passes_for_model(
+            dataset=dataset,
+            engine=engine,
+            metas=metas,
+            raw_outputs=raw_outputs,
+            retry_pending=retry_pending,
+            batch_size=batch_size,
+            retry_sampling=retry_sampling,
+        )
+        extract_pending = _finalize_retry_pass_for_model(
+            dataset=dataset,
+            metas=metas,
+            raw_outputs=raw_outputs,
+            retry_pending=retry_pending,
+            retry_output_by_meta=retry_output_by_meta,
+            retry_raw_had_strict=retry_raw_had_strict,
+            attempts=attempts,
+        )
+        _finalize_extract_pass_for_model(
+            dataset=dataset,
+            engine=engine,
+            metas=metas,
+            raw_outputs=raw_outputs,
+            extract_pending=extract_pending,
+            retry_output_by_meta=retry_output_by_meta,
+            retry_raw_had_strict=retry_raw_had_strict,
+            batch_size=batch_size,
+            attempts=attempts,
+        )
+
+    return attempts
 
 
 def _apply_answer_update(
@@ -547,81 +1093,184 @@ def _parse_judge_override_args(args: argparse.Namespace) -> dict[str, Any] | Non
     }
 
 
-def _process_target_row(
+def _extract_only_existing_result(
     *,
     dataset: DatasetName,
     path: Path,
     row: dict[str, Any],
     orig_id: int,
     engine_mgr: EngineManager,
-    batch_size: int | None,
 ) -> RowUpdateResult:
-    _ensure_row_has_fields(row)
     before = row.get("final_judge_answer")
     jt = cast(dict[str, Any], row.get("judge_trace") or {})
-
-    stored_invalid = _needs_retry(row, dataset=dataset)
-    if not stored_invalid:
+    model_name = str(jt.get("judge_model") or "").strip()
+    if not model_name:
         return RowUpdateResult(
             path=path,
             orig_id=orig_id,
-            action="skip_valid",
+            action="extract_only_failed",
             before=before,
             after=before,
             changed=False,
-            details="Stored final_judge_answer is already strict-valid; no retry needed.",
+            details="Missing judge_trace.judge_model; cannot run extraction-only pass.",
         )
 
-    reparsed, parse_mode, parse_source, raw_had_strict_final, retry_had_strict_final = _try_reparse_existing(
-        row, dataset=dataset
-    )
-    if reparsed is not None:
-        row_before_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
-        _apply_answer_update(
-            dataset=dataset,
-            row=row,
-            judged_answer=reparsed,
-            parse_failed=False,
-            used_fallback=(parse_mode == "recover"),
-            parse_mode=parse_mode,
-            parse_source=parse_source,
-            retry_reason=None,
-            finish_state="reparse_existing",
-            raw_had_strict_final=raw_had_strict_final,
-            retry_had_strict_final=retry_had_strict_final,
-            judge_raw_output=None,
-            judge_retry_output=None,
-            judge_context=None,
-            rerun=False,
-        )
-        row_after_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
-        after = row.get("final_judge_answer")
+    raw_output = str(jt.get("judge_raw_response") or "")
+    retry_output = str(jt.get("judge_retry_raw_response") or "")
+    if not raw_output and not retry_output:
         return RowUpdateResult(
             path=path,
             orig_id=orig_id,
-            action="reparsed",
+            action="extract_only_failed",
             before=before,
-            after=after,
-            changed=(row_before_update != row_after_update),
-            details=f"Recovered via existing judge output parse mode={parse_mode} source={parse_source}.",
+            after=before,
+            changed=False,
+            details="No stored judge outputs available for extraction-only pass.",
         )
 
-    model_name = str(jt.get("judge_model") or "").strip()
-    if not model_name:
-        raise ValueError("Row missing judge_trace.judge_model; cannot rerun judge.")
+    raw_task = cast(dict[str, Any], row["raw_task"])
+    engine = engine_mgr.get_engine(model_name)
+    extract_ctx = _build_extract_context(raw_output=raw_output, retry_output=retry_output, dataset=dataset)
+    try:
+        extract_output = str(
+            engine.generate_batch(
+                [extract_ctx],
+                batch_size=1,
+                sampling_kwargs=dict(EXTRACT_SAMPLING_KWARGS),
+            )[0]
+        )
+    except Exception as e:
+        return RowUpdateResult(
+            path=path,
+            orig_id=orig_id,
+            action="extract_only_failed",
+            before=before,
+            after=before,
+            changed=False,
+            details=f"Extraction generation error: {type(e).__name__}: {e}",
+        )
 
-    attempt = _run_judge_with_retry(
+    parsed = _parse_judge_text(
         dataset=dataset,
-        row=row,
-        engine_mgr=engine_mgr,
-        model_name=model_name,
-        batch_size=batch_size,
+        text=extract_output,
+        raw_task=raw_task,
+        source_prefix="extract",
+        strict_enabled=True,
+        recovery_enabled=True,
     )
+    if parsed.answer is None:
+        return RowUpdateResult(
+            path=path,
+            orig_id=orig_id,
+            action="extract_only_failed",
+            before=before,
+            after=before,
+            changed=False,
+            details="Extraction output still unparsable.",
+        )
 
     row_before_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
     _apply_answer_update(
         dataset=dataset,
         row=row,
+        judged_answer=parsed.answer,
+        parse_failed=False,
+        used_fallback=(parsed.mode == "recover"),
+        parse_mode=parsed.mode,
+        parse_source=parsed.source,
+        retry_reason="parse_none_then_extract_only",
+        finish_state="extract_only_parsed",
+        raw_had_strict_final=bool(jt.get("judge_raw_had_strict_final")),
+        retry_had_strict_final=bool(jt.get("judge_retry_had_strict_final")),
+        judge_raw_output=None,
+        judge_retry_output=None,
+        judge_context=None,
+        rerun=False,
+    )
+    row_after_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    after = row.get("final_judge_answer")
+    return RowUpdateResult(
+        path=path,
+        orig_id=orig_id,
+        action="extract_only",
+        before=before,
+        after=after,
+        changed=(row_before_update != row_after_update),
+        details=f"Extracted final choice from stored judge outputs. Parse mode={parsed.mode} source={parsed.source}.",
+    )
+
+
+def _apply_reparse_result(
+    *,
+    dataset: DatasetName,
+    path: Path,
+    row: dict[str, Any],
+    orig_id: int,
+    before: Any,
+    reparsed: str,
+    parse_mode: str,
+    parse_source: str,
+    raw_had_strict_final: bool,
+    retry_had_strict_final: bool,
+) -> RowUpdateResult:
+    row_before_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    _apply_answer_update(
+        dataset=dataset,
+        row=row,
+        judged_answer=reparsed,
+        parse_failed=False,
+        used_fallback=(parse_mode == "recover"),
+        parse_mode=parse_mode,
+        parse_source=parse_source,
+        retry_reason=None,
+        finish_state="reparse_existing",
+        raw_had_strict_final=raw_had_strict_final,
+        retry_had_strict_final=retry_had_strict_final,
+        judge_raw_output=None,
+        judge_retry_output=None,
+        judge_context=None,
+        rerun=False,
+    )
+    row_after_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    after = row.get("final_judge_answer")
+    return RowUpdateResult(
+        path=path,
+        orig_id=orig_id,
+        action="reparsed",
+        before=before,
+        after=after,
+        changed=(row_before_update != row_after_update),
+        details=f"Recovered via existing judge output parse mode={parse_mode} source={parse_source}.",
+    )
+
+
+def _rerun_action(attempt: JudgeAttempt) -> str:
+    if attempt.parse_failed:
+        return "rerun_failed"
+    if attempt.retry_used:
+        return "rerun_retry"
+    return "rerun"
+
+
+def _rerun_details(attempt: JudgeAttempt) -> str:
+    return (
+        "Reran judge with rebuilt context."
+        + (" Retry was used." if attempt.retry_used else "")
+        + f" Parse mode={attempt.parse_mode} source={attempt.parse_source}."
+        + (" Still unparsable after retry." if attempt.parse_failed else "")
+    )
+
+
+def _apply_rerun_attempt_result(
+    *,
+    dataset: DatasetName,
+    req: RerunRequest,
+    attempt: JudgeAttempt,
+) -> RowUpdateResult:
+    row_before_update = json.dumps(req.row, ensure_ascii=False, sort_keys=True)
+    _apply_answer_update(
+        dataset=dataset,
+        row=req.row,
         judged_answer=attempt.judged_answer,
         parse_failed=attempt.parse_failed,
         used_fallback=attempt.used_fallback,
@@ -636,23 +1285,92 @@ def _process_target_row(
         judge_context=attempt.judge_context,
         rerun=True,
     )
-    row_after_update = json.dumps(row, ensure_ascii=False, sort_keys=True)
-    after = row.get("final_judge_answer")
-    action = "rerun_retry" if attempt.retry_used else "rerun"
-    if attempt.parse_failed:
-        action = "rerun_failed"
+    row_after_update = json.dumps(req.row, ensure_ascii=False, sort_keys=True)
+    after = req.row.get("final_judge_answer")
     return RowUpdateResult(
-        path=path,
-        orig_id=orig_id,
-        action=action,
-        before=before,
+        path=req.path,
+        orig_id=req.orig_id,
+        action=_rerun_action(attempt),
+        before=req.before,
         after=after,
         changed=(row_before_update != row_after_update),
-        details=(
-            "Reran judge with rebuilt context."
-            + (" Retry was used." if attempt.retry_used else "")
-            + f" Parse mode={attempt.parse_mode} source={attempt.parse_source}."
-            + (" Still unparsable after retry." if attempt.parse_failed else "")
+        details=_rerun_details(attempt),
+    )
+
+
+def _plan_target_row(
+    *,
+    dataset: DatasetName,
+    path: Path,
+    row: dict[str, Any],
+    row_idx: int,
+    orig_id: int,
+    extract_only_existing: bool,
+    engine_mgr: EngineManager,
+) -> RowPlan:
+    _ensure_row_has_fields(row)
+    before = row.get("final_judge_answer")
+
+    if not _needs_retry(row, dataset=dataset):
+        return RowPlan(
+            immediate_result=RowUpdateResult(
+                path=path,
+                orig_id=orig_id,
+                action="skip_valid",
+                before=before,
+                after=before,
+                changed=False,
+                details="Stored final_judge_answer is already strict-valid; no retry needed.",
+            ),
+            rerun_request=None,
+        )
+
+    reparsed, parse_mode, parse_source, raw_had_strict_final, retry_had_strict_final = _try_reparse_existing(
+        row, dataset=dataset
+    )
+    if reparsed is not None:
+        return RowPlan(
+            immediate_result=_apply_reparse_result(
+                dataset=dataset,
+                path=path,
+                row=row,
+                orig_id=orig_id,
+                before=before,
+                reparsed=reparsed,
+                parse_mode=parse_mode,
+                parse_source=parse_source,
+                raw_had_strict_final=raw_had_strict_final,
+                retry_had_strict_final=retry_had_strict_final,
+            ),
+            rerun_request=None,
+        )
+
+    if extract_only_existing:
+        return RowPlan(
+            immediate_result=_extract_only_existing_result(
+                dataset=dataset,
+                path=path,
+                row=row,
+                orig_id=orig_id,
+                engine_mgr=engine_mgr,
+            ),
+            rerun_request=None,
+        )
+
+    jt = cast(dict[str, Any], row.get("judge_trace") or {})
+    model_name = str(jt.get("judge_model") or "").strip()
+    if not model_name:
+        raise ValueError(f"{path}: orig_id={orig_id} missing judge_trace.judge_model; cannot rerun judge.")
+
+    return RowPlan(
+        immediate_result=None,
+        rerun_request=RerunRequest(
+            path=path,
+            orig_id=orig_id,
+            row_idx=row_idx,
+            row=row,
+            before=before,
+            model_name=model_name,
         ),
     )
 
@@ -685,15 +1403,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--enable_yarn", action="store_true", help="Enable YaRN RoPE scaling for long context.")
     ap.add_argument("--enforce_eager", action="store_true", help="Run vLLM in eager mode.")
-    ap.add_argument("--batch_size", type=int, default=1, help="Batch size for judge rerun generation.")
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Batch size for judge rerun generation (applies to batched raw/retry passes).",
+    )
 
-    ap.add_argument("--judge_max_tokens", type=int, default=None, help="Optional judge max new tokens override.")
+    ap.add_argument(
+        "--judge_max_tokens",
+        type=int,
+        default=None,
+        help="Optional judge max new tokens override.",
+    )
     ap.add_argument("--judge_temperature", type=float, default=None, help="Optional judge temperature override.")
     ap.add_argument("--judge_top_p", type=float, default=None, help="Optional judge top_p override.")
     ap.add_argument("--judge_top_k", type=int, default=None, help="Optional judge top_k override.")
 
     ap.add_argument("--dry_run", action="store_true", help="Report planned changes without writing files.")
     ap.add_argument("--no_backup", action="store_true", help="Do not create .bak.* files before rewriting.")
+    ap.add_argument(
+        "--extract_only_existing",
+        action="store_true",
+        help="Do not rerun judge generation; run only extraction pass from stored judge outputs.",
+    )
     return ap
 
 
@@ -746,6 +1479,7 @@ def main() -> None:
                 row_idx_by_orig.setdefault(oid, []).append(idx)
 
             file_changed = False
+            rerun_requests: list[RerunRequest] = []
             for orig_id in orig_ids:
                 idxs = row_idx_by_orig.get(int(orig_id), [])
                 if not idxs:
@@ -756,18 +1490,47 @@ def main() -> None:
                     )
                 row_idx = idxs[0]
                 row = idx_to_obj[row_idx]
-                res = _process_target_row(
+                plan = _plan_target_row(
                     dataset=dataset,
                     path=path,
                     row=row,
+                    row_idx=row_idx,
                     orig_id=orig_id,
+                    extract_only_existing=bool(args.extract_only_existing),
+                    engine_mgr=manager,
+                )
+                if plan.immediate_result is not None:
+                    res = plan.immediate_result
+                    all_results.append(res)
+                    file_changed = file_changed or bool(res.changed)
+                    if res.action != "skip_valid":
+                        lines[row_idx] = json.dumps(row, ensure_ascii=False)
+                    continue
+                if plan.rerun_request is not None:
+                    rerun_requests.append(plan.rerun_request)
+                    continue
+                raise RuntimeError(f"{path}: orig_id={orig_id} produced no row plan.")
+
+            if rerun_requests:
+                attempts_by_target = _run_judge_with_retry_batched(
+                    dataset=dataset,
+                    requests=rerun_requests,
                     engine_mgr=manager,
                     batch_size=int(args.batch_size) if args.batch_size is not None else None,
                 )
-                all_results.append(res)
-                file_changed = file_changed or bool(res.changed)
-                if row_idx in idx_to_obj:
-                    lines[row_idx] = json.dumps(row, ensure_ascii=False)
+                for req in rerun_requests:
+                    key = (req.path, req.orig_id)
+                    attempt = attempts_by_target.get(key)
+                    if attempt is None:
+                        raise RuntimeError(f"Missing batched rerun attempt for {req.path}: orig_id={req.orig_id}")
+                    res = _apply_rerun_attempt_result(
+                        dataset=dataset,
+                        req=req,
+                        attempt=attempt,
+                    )
+                    all_results.append(res)
+                    file_changed = file_changed or bool(res.changed)
+                    lines[req.row_idx] = json.dumps(req.row, ensure_ascii=False)
 
             if not args.dry_run and file_changed:
                 if not args.no_backup:
