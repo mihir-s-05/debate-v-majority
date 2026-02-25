@@ -233,7 +233,7 @@ class EngineManager:
         return out
 
     def judge_max_new_tokens(self, model_name: str, sampling_kwargs: dict[str, Any] | None) -> int:
-        if sampling_kwargs and "max_tokens" in sampling_kwargs:
+        if sampling_kwargs and sampling_kwargs.get("max_tokens") is not None:
             return int(sampling_kwargs["max_tokens"])
         cfg = self._get_sampling_cfg(model_name)
         return int(cfg.max_tokens or 4096)
@@ -381,16 +381,8 @@ def _try_reparse_existing(
         recovery_enabled=False,
     )
     raw_had_strict = bool(raw_strict.strict_success)
-    parsed_raw = _parse_judge_text(
-        dataset=dataset,
-        text=raw_out,
-        raw_task=raw_task,
-        source_prefix="raw",
-        strict_enabled=True,
-        recovery_enabled=True,
-    )
-    if parsed_raw.answer is not None:
-        return parsed_raw.answer, parsed_raw.mode, parsed_raw.source, raw_had_strict, False
+    if raw_strict.answer is not None:
+        return raw_strict.answer, raw_strict.mode, raw_strict.source, raw_had_strict, False
 
     retry_had_strict = False
     if retry_out is not None:
@@ -403,16 +395,8 @@ def _try_reparse_existing(
             recovery_enabled=False,
         )
         retry_had_strict = bool(retry_strict.strict_success)
-        parsed_retry = _parse_judge_text(
-            dataset=dataset,
-            text=retry_out,
-            raw_task=raw_task,
-            source_prefix="retry",
-            strict_enabled=True,
-            recovery_enabled=True,
-        )
-        if parsed_retry.answer is not None:
-            return parsed_retry.answer, parsed_retry.mode, parsed_retry.source, raw_had_strict, retry_had_strict
+        if retry_strict.answer is not None:
+            return retry_strict.answer, retry_strict.mode, retry_strict.source, raw_had_strict, retry_had_strict
 
     return None, "none", "none", raw_had_strict, retry_had_strict
 
@@ -567,10 +551,15 @@ def _build_retry_sampling_kwargs(
     *,
     sampling_kwargs: dict[str, Any] | None,
     judge_max_new_tokens: int,
+    judge_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     retry_sampling = dict(sampling_kwargs or {})
-    retry_sampling["temperature"] = 0.0
-    retry_sampling["top_p"] = 1.0
+    temp_overridden = bool(judge_overrides and judge_overrides.get("temperature") is not None)
+    top_p_overridden = bool(judge_overrides and judge_overrides.get("top_p") is not None)
+    if not temp_overridden:
+        retry_sampling["temperature"] = 0.0
+    if not top_p_overridden:
+        retry_sampling["top_p"] = 1.0
     retry_sampling["max_tokens"] = int(judge_max_new_tokens)
     return retry_sampling
 
@@ -624,13 +613,13 @@ def _run_raw_pass_for_model(
             strict_enabled=True,
             recovery_enabled=True,
         )
-        if parsed_raw.answer is not None:
+        if parsed_raw.answer is not None and parsed_raw.mode != "recover":
             attempts[key] = _build_judge_attempt(
                 judged_answer=parsed_raw.answer,
                 raw_output=raw_output_s,
                 retry_output=None,
                 parse_failed=False,
-                used_fallback=(parsed_raw.mode == "recover"),
+                used_fallback=False,
                 retry_used=False,
                 parse_mode=parsed_raw.mode,
                 parse_source=parsed_raw.source,
@@ -689,7 +678,7 @@ def _run_retry_passes_for_model(
             raw_task=metas[i].raw_task,
             source_prefix="retry",
             strict_enabled=True,
-            recovery_enabled=True,
+            recovery_enabled=False,
         )
         if parsed_probe.answer is None:
             retry_pending2.append(i)
@@ -775,7 +764,7 @@ def _finalize_retry_pass_for_model(
             recovery_enabled=True,
         )
         judged = parsed_retry.answer
-        if judged is None:
+        if judged is None or parsed_retry.mode == "recover":
             extract_pending.append(i)
             continue
 
@@ -784,7 +773,7 @@ def _finalize_retry_pass_for_model(
             raw_output=raw_output_s,
             retry_output=retry_output,
             parse_failed=False,
-            used_fallback=(parsed_retry.mode == "recover"),
+            used_fallback=False,
             retry_used=True,
             parse_mode=parsed_retry.mode,
             parse_source=parsed_retry.source,
@@ -810,12 +799,76 @@ def _finalize_extract_pass_for_model(
     batch_size: int | None,
     attempts: dict[tuple[Path, int], JudgeAttempt],
 ) -> None:
-    extract_ctxs: list[list[dict[str, str]]] = []
-    extract_idx: list[int] = []
+    if not extract_pending:
+        return
+
+    retry_only_ctxs: list[list[dict[str, str]]] = []
+    retry_only_idx: list[int] = []
+    unresolved: list[int] = []
     for i in extract_pending:
+        retry_output = retry_output_by_meta.get(i) or ""
+        if retry_output:
+            retry_only_ctxs.append(
+                _build_extract_retry_only_context(retry_output=retry_output, dataset=dataset)
+            )
+            retry_only_idx.append(i)
+        else:
+            unresolved.append(i)
+
+    retry_only_out = _generate_batch_texts(
+        engine=engine,
+        contexts=retry_only_ctxs,
+        batch_size=batch_size,
+        sampling_kwargs=dict(EXTRACT_SAMPLING_KWARGS),
+        error_prefix=EXTRACT_ERROR_PREFIX,
+    )
+
+    for i, out_s in zip(retry_only_idx, retry_only_out):
+        meta = metas[i]
+        req = meta.req
+        key = (req.path, req.orig_id)
         raw_output_s = raw_outputs[i]
         retry_output = retry_output_by_meta.get(i) or ""
-        extract_ctxs.append(_build_extract_context(raw_output=raw_output_s, retry_output=retry_output, dataset=dataset))
+        if out_s.startswith(f"[{EXTRACT_ERROR_PREFIX}]"):
+            unresolved.append(i)
+            continue
+
+        parsed_extract = _parse_judge_text(
+            dataset=dataset,
+            text=out_s,
+            raw_task=meta.raw_task,
+            source_prefix="extract_retry_only",
+            strict_enabled=True,
+            recovery_enabled=False,
+        )
+        if parsed_extract.answer is None:
+            unresolved.append(i)
+            continue
+
+        attempts[key] = _build_judge_attempt(
+            judged_answer=parsed_extract.answer,
+            raw_output=raw_output_s,
+            retry_output=retry_output,
+            parse_failed=False,
+            used_fallback=False,
+            retry_used=True,
+            parse_mode=parsed_extract.mode,
+            parse_source=parsed_extract.source,
+            retry_reason="parse_none_then_extract_retry_only",
+            finish_state="extract_parsed",
+            raw_had_strict_final=retry_raw_had_strict[i],
+            retry_had_strict_final=False,
+            judge_context=meta.judge_context,
+        )
+
+    extract_ctxs: list[list[dict[str, str]]] = []
+    extract_idx: list[int] = []
+    for i in unresolved:
+        raw_output_s = raw_outputs[i]
+        retry_output = retry_output_by_meta.get(i) or ""
+        extract_ctxs.append(
+            _build_extract_context(raw_output=raw_output_s, retry_output=retry_output, dataset=dataset)
+        )
         extract_idx.append(i)
 
     extract_out = _generate_batch_texts(
@@ -856,7 +909,7 @@ def _finalize_extract_pass_for_model(
             raw_task=meta.raw_task,
             source_prefix="extract",
             strict_enabled=True,
-            recovery_enabled=True,
+            recovery_enabled=False,
         )
         if parsed_extract.answer is None:
             attempts[key] = _build_judge_attempt(
@@ -881,7 +934,7 @@ def _finalize_extract_pass_for_model(
             raw_output=raw_output_s,
             retry_output=retry_output,
             parse_failed=False,
-            used_fallback=(parsed_extract.mode == "recover"),
+            used_fallback=False,
             retry_used=True,
             parse_mode=parsed_extract.mode,
             parse_source=parsed_extract.source,
@@ -891,6 +944,21 @@ def _finalize_extract_pass_for_model(
             retry_had_strict_final=False,
             judge_context=meta.judge_context,
         )
+
+
+def _build_extract_retry_only_context(
+    *, retry_output: str, dataset: DatasetName | None = None,
+) -> list[dict[str, str]]:
+    nudge = _get_extract_nudge(dataset) if dataset else JUDGE_EXTRACT_FINAL_NUDGE
+    system_desc = (
+        "You extract a final answer from prior judge output."
+        if dataset and str(dataset) != "gpqa"
+        else "You extract a final multiple-choice answer from prior judge output."
+    )
+    return [
+        {"role": "system", "content": system_desc},
+        {"role": "user", "content": nudge + "\n\nPrior judge output:\n" + str(retry_output or "")},
+    ]
 
 
 def _build_extract_context(
@@ -976,6 +1044,7 @@ def _run_judge_with_retry_batched(
         retry_sampling = _build_retry_sampling_kwargs(
             sampling_kwargs=sampling_kwargs,
             judge_max_new_tokens=judge_max_new_tokens,
+            judge_overrides=getattr(engine_mgr, "_judge_overrides", None),
         )
         retry_pending, retry_raw_had_strict = _run_raw_pass_for_model(
             dataset=dataset,
@@ -1156,7 +1225,7 @@ def _extract_only_existing_result(
         raw_task=raw_task,
         source_prefix="extract",
         strict_enabled=True,
-        recovery_enabled=True,
+        recovery_enabled=False,
     )
     if parsed.answer is None:
         return RowUpdateResult(
@@ -1175,7 +1244,7 @@ def _extract_only_existing_result(
         row=row,
         judged_answer=parsed.answer,
         parse_failed=False,
-        used_fallback=(parsed.mode == "recover"),
+        used_fallback=False,
         parse_mode=parsed.mode,
         parse_source=parsed.source,
         retry_reason="parse_none_then_extract_only",
