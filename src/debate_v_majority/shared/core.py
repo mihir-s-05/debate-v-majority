@@ -16,11 +16,7 @@ if TYPE_CHECKING:
 THINKING_STRIP_THRESHOLD = 0.85  # Strip thinking when context reaches this fraction
 
 
-# =============================================================================
-# Thinking content stripping (for reasoning models like Qwen3, DeepSeek-R1)
-# =============================================================================
 
-# Pattern matches <think>...</think> blocks (case-insensitive, handles newlines)
 _THINKING_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
@@ -87,9 +83,6 @@ def strip_thinking_from_contexts(
     return result, num_changed
 
 
-# =============================================================================
-# Math parsing
-# =============================================================================
 
 
 def last_boxed_only_string(string: str) -> str | None:
@@ -141,9 +134,6 @@ def parse_math(text: str) -> str | None:
     return remove_boxed(boxed)
 
 
-# =============================================================================
-# String normalization
-# =============================================================================
 
 
 def normalize_numeric_string(s: str | None) -> str | None:
@@ -154,7 +144,6 @@ def normalize_numeric_string(s: str | None) -> str | None:
     if not s:
         return None
     s = re.sub(r"(\d),(\d)", r"\1\2", s)
-    # Canonicalize integer forms with leading zeros.
     m = re.fullmatch(r"-?\d+", s)
     if m:
         sign = ""
@@ -179,18 +168,12 @@ def normalize_freeform_string(s: str | None) -> str | None:
     return s.lower()
 
 
-# =============================================================================
-# Majority voting
-# =============================================================================
 
 
 def most_frequent_answer(answers: list[str | None] | None) -> str | None:
     """Return the most frequent answer, or None if no clear majority."""
     if not answers:
         return None
-    # Ignore unparsable outputs when voting. Treating `None` as a normal category
-    # makes voting unnecessarily brittle (e.g., [None, None, "C"] would otherwise
-    # return None even though the model produced a valid answer).
     filtered = [a for a in answers if a is not None]
     if not filtered:
         return None
@@ -202,9 +185,6 @@ def most_frequent_answer(answers: list[str | None] | None) -> str | None:
     return top[0] if len(top) == 1 else None
 
 
-# =============================================================================
-# Conversation/transcript utilities
-# =============================================================================
 
 
 def render_agent_transcript(agent_conv: list[dict[str, str]], include_system: bool = False) -> str:
@@ -283,9 +263,6 @@ def render_agent_assistant_rounds(
     return "\n\n".join(parts)
 
 
-# =============================================================================
-# Error detection
-# =============================================================================
 
 
 def exception_chain_contains(err: BaseException, needles: tuple[str, ...], max_depth: int = 5) -> bool:
@@ -343,7 +320,6 @@ def is_vllm_oom_like(err: BaseException) -> bool:
         return True
     if is_vllm_engine_dead(err):
         return True
-    # Check chained exceptions
     cur: BaseException | None = err
     for _ in range(5):
         if cur is None:
@@ -393,9 +369,6 @@ def extract_prompt_length_tokens(err: BaseException) -> int | None:
     return None
 
 
-# =============================================================================
-# Process management
-# =============================================================================
 
 
 def kill_process_tree(pid: int) -> None:
@@ -419,9 +392,6 @@ def kill_process_tree(pid: int) -> None:
         pass
 
 
-# =============================================================================
-# Token counting
-# =============================================================================
 
 
 def _hash_obj_for_cache(hasher: "hashlib._Hash", obj: Any) -> None:
@@ -437,7 +407,6 @@ def _hash_obj_for_cache(hasher: "hashlib._Hash", obj: Any) -> None:
         hasher.update(b"\0")
 
     def _u_int(n: int) -> None:
-        # Use 64-bit packing when possible; fall back to decimal bytes.
         try:
             hasher.update(struct.pack("!q", int(n)))
             hasher.update(b"\0")
@@ -464,12 +433,8 @@ def _hash_obj_for_cache(hasher: "hashlib._Hash", obj: Any) -> None:
         return
     if isinstance(obj, str):
         _u(b"str")
-        # Avoid keeping large strings alive in the cache key, and avoid
-        # re-encoding big prompts on every cache lookup. Python string hashes
-        # are cached per object, so this is typically O(1) after first use.
         _u_int(len(obj))
         _u_int(hash(obj))
-        # Add small, stable-ish extra signal to reduce hash-collision risk.
         prefix = obj[:64]
         suffix = obj[-64:]
         _u_int(hash(prefix))
@@ -492,7 +457,6 @@ def _hash_obj_for_cache(hasher: "hashlib._Hash", obj: Any) -> None:
     if isinstance(obj, dict):
         _u(b"dict")
         _u_int(len(obj))
-        # Sort keys for determinism (messages are expected to be dict-like).
         items = list(obj.items())
         items.sort(key=lambda kv: (repr(kv[0]), type(kv[0]).__qualname__))
         for k, v in items:
@@ -500,7 +464,6 @@ def _hash_obj_for_cache(hasher: "hashlib._Hash", obj: Any) -> None:
             _hash_obj_for_cache(hasher, v)
         return
 
-    # Fallback: incorporate type and a bounded repr to keep hashing safe.
     _u(b"obj")
     _u(f"{type(obj).__module__}.{type(obj).__qualname__}".encode("utf-8"))
     try:
@@ -527,7 +490,6 @@ def _messages_cache_key(messages: list[dict[str, Any]]) -> tuple[int, int, str]:
 class PromptTokenCounter:
     """Token counter for chat messages with lazy tokenizer loading and caching."""
 
-    # Class-level cache shared across instances (keyed by model_name + messages)
     _token_cache: dict[tuple, int] = {}
     _cache_max_size: int = 4096
 
@@ -546,7 +508,6 @@ class PromptTokenCounter:
 
     def _cache_key(self, messages: list[dict[str, Any]]) -> tuple:
         """Create a full cache key including model name."""
-        # Keep cache keys small and include template options that affect encoding.
         add_generation_prompt = True
         return (self._model_name, add_generation_prompt, _messages_cache_key(messages))
 
@@ -556,7 +517,6 @@ class PromptTokenCounter:
 
     def _set_cached(self, key: tuple, count: int) -> None:
         """Cache token count with simple LRU-style eviction."""
-        # Simple eviction: clear half the cache when full
         if len(self._token_cache) >= self._cache_max_size:
             keys_to_remove = list(self._token_cache.keys())[: self._cache_max_size // 2]
             for k in keys_to_remove:
@@ -598,18 +558,14 @@ class PromptTokenCounter:
         if approx < exact_if_large:
             return approx
 
-        # Check cache first before expensive tokenization
         cache_key = self._cache_key(messages)
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
-        # Use exact token counting when near the limit to avoid underestimation
-        # that could lead to position overflow and CUDA device-side asserts
         try:
             tok = self._get_tokenizer()
         except Exception:
-            # If tokenizer fails, add a safety margin to the approximation
             return int(approx * 1.2)
         try:
             if hasattr(tok, "apply_chat_template"):
@@ -624,7 +580,6 @@ class PromptTokenCounter:
             self._set_cached(cache_key, count)
             return count
         except Exception:
-            # If all exact methods fail, add safety margin
             return int(approx * 1.2)
 
 
@@ -658,7 +613,6 @@ def truncate_chat_messages_to_fit(
 
     msgs = [dict(m) for m in messages]
 
-    # Preserve system prefix
     sys_prefix: list[dict[str, str]] = []
     i = 0
     while i < len(msgs) and msgs[i].get("role") == "system":
@@ -666,7 +620,6 @@ def truncate_chat_messages_to_fit(
         i += 1
     tail = msgs[i:]
 
-    # Drop oldest turns until fits
     while len(tail) > 1 and not _fits(sys_prefix + tail):
         tail = tail[1:]
 
@@ -676,7 +629,6 @@ def truncate_chat_messages_to_fit(
     if not tail:
         return sys_prefix, True
 
-    # Truncate remaining message content
     msg = dict(tail[0])
     content = msg.get("content") or ""
     if not content:
@@ -694,7 +646,6 @@ def truncate_chat_messages_to_fit(
         msg["content"] = content[-max(1, min(len(content), max_prompt_tokens * 4)) :]
         return sys_prefix + [msg], True
 
-    # Binary search for max content that fits
     lo, hi = 1, len(content_ids)
     best: str | None = None
     while lo <= hi:
@@ -717,9 +668,6 @@ def truncate_chat_messages_to_fit(
     return sys_prefix + [msg], True
 
 
-# =============================================================================
-# Judge context utilities
-# =============================================================================
 
 
 def round_block_start(round_num: int, block_size: int) -> int:

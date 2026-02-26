@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .shared import parse_math, normalize_numeric_string
+from ..shared import parse_math, normalize_numeric_string
 
 
 # =============================================================================

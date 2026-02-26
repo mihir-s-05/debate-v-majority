@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debate-v-majority"
+version = "0.1.0"
+description = "Evaluation harness for majority voting and multi-agent debate."
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "vllm>=0.14",
+  "transformers",
+  "datasets",
+  "tqdm",
+]
+
+[project.scripts]
+debate-v-majority = "debate_v_majority.cli:main"
+rejudge-targets = "debate_v_majority.tools.rejudge_targets:main"
+analyze-results = "debate_v_majority.tools.analyze_results:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["debate_v_majority*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -7,9 +7,8 @@ Reads jsonl runs from:
   - multiagent_debate/results/gpqa_quick/
 
 Writes:
-  - ~/debug_majority_debate/_autogen/summary.json
-  - ~/debug_majority_debate/_autogen/tables.md
-  - Appends incremental findings to ~/debug_majority_debate/FINDINGS_LOG.md
+  - <out-dir>/summary.json
+  - <out-dir>/tables.md
 """
 
 from __future__ import annotations
@@ -25,10 +24,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-HOME = Path.home()
-DEFAULT_RESULTS_DIR = Path("/home/ubuntu/multi-agent-attack/multiagent_debate/results")
-DEFAULT_OUT_DIR = HOME / "debug_majority_debate" / "_autogen"
-FINDINGS_LOG = HOME / "debug_majority_debate" / "FINDINGS_LOG.md"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_RESULTS_DIR = REPO_ROOT / "results"
+DEFAULT_OUT_DIR = REPO_ROOT / "_autogen"
 TARGET_MODEL_TAG = os.environ.get("TARGET_MODEL_TAG", "Qwen/Qwen3-8B")
 
 
@@ -37,11 +35,7 @@ def _now_iso() -> str:
 
 
 def append_findings_md(md: str) -> None:
-    FINDINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(FINDINGS_LOG, "a", encoding="utf-8") as f:
-        f.write("\n")
-        f.write(f"## {_now_iso()}\n\n")
-        f.write(md.rstrip() + "\n")
+    _ = md
 
 
 def read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -237,15 +231,9 @@ def should_include_path(path: Path, *, target_model_tag: str) -> tuple[bool, str
 
 def load_parsers() -> tuple[Any, Any]:
     """
-    Import parsers from ~/debug_majority_debate as a package.
+    Import dataset parser modules.
     """
-    import sys
-
-    # Allow `import debug_majority_debate.*`
-    if str(HOME) not in sys.path:
-        sys.path.insert(0, str(HOME))
-    import debug_majority_debate.aime25 as aime25
-    import debug_majority_debate.gpqa as gpqa
+    from ..datasets import aime25, gpqa
 
     return aime25, gpqa
 
@@ -813,7 +801,6 @@ def analyze(results_dir: Path, out_dir: Path) -> None:
         },
         "trans_choice_gpqa": {str(k): dict(v) for k, v in trans_choice_gpqa.items()},
         "per_question": {str(k): dict(v) for k, v in per_question.items()},
-        "examples": examples,
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(out_summary, f, indent=2, sort_keys=True)
@@ -1211,102 +1198,7 @@ def analyze(results_dir: Path, out_dir: Path) -> None:
         + "\n"
     )
 
-    # Save examples (trim to small number per dataset)
-    for ds in list(examples.keys()):
-        # Keep top 12 only to avoid bloat.
-        examples[ds] = examples[ds][:12]
-    with open(out_dir / "examples.json", "w", encoding="utf-8") as f:
-        json.dump(examples, f, indent=2, sort_keys=True)
-
-    # Generate a lightweight case-studies markdown file by re-loading the referenced records.
-    def load_record_from_run(run_name: str, orig_id: int | None) -> dict[str, Any] | None:
-        # Determine dataset dir from filename prefix.
-        if "_aime_" in run_name:
-            p = results_dir / "aime25_quick" / run_name
-        elif "_gpqa_" in run_name:
-            p = results_dir / "gpqa_quick" / run_name
-        else:
-            return None
-        if not p.exists() or orig_id is None:
-            return None
-        try:
-            for rec in read_jsonl(p):
-                if rec.get("orig_id") == orig_id:
-                    return rec
-        except Exception:
-            return None
-        return None
-
-    def q_excerpt(rec: dict[str, Any] | None, n: int = 420) -> str:
-        if not rec:
-            return ""
-        q = rec.get("question") or ""
-        if not isinstance(q, str):
-            q = str(q)
-        q = q.strip().replace("\n", " ")
-        if len(q) <= n:
-            return q
-        return q[:n] + "…"
-
-    def md_case(title: str, items: list[dict[str, Any]]) -> str:
-        out: list[str] = []
-        out.append(f"## {title}\n")
-        for ex in items:
-            run = ex.get("run", "")
-            cfg = ex.get("cfg", "")
-            oid = ex.get("orig_id", "")
-            gt = ex.get("gt", "")
-            rec = load_record_from_run(str(run), int(oid) if isinstance(oid, int) else None)
-            out.append(f"### {run} (cfg={cfg}, orig_id={oid})\n")
-            out.append(f"- Ground truth: `{gt}`")
-            if "final_majority" in ex:
-                out.append(f"- Final majority: `{ex.get('final_majority')}`")
-            if "final_judge" in ex:
-                out.append(f"- Final judge: `{ex.get('final_judge')}`")
-            if "unanimous_final" in ex:
-                out.append(f"- Unanimous final: `{ex.get('unanimous_final')}`")
-            if "judge" in ex:
-                out.append(f"- Judge: `{ex.get('judge')}`")
-            qe = q_excerpt(rec)
-            if qe:
-                out.append(f"- Question excerpt: {qe}")
-            if ex.get("agent_tail"):
-                out.append("\n**Agent tail**\n")
-                out.append("```text")
-                out.append(str(ex.get("agent_tail", "")).strip())
-                out.append("```\n")
-            if ex.get("judge_tail"):
-                out.append("\n**Judge tail**\n")
-                out.append("```text")
-                out.append(str(ex.get("judge_tail", "")).strip())
-                out.append("```\n")
-        return "\n".join(out).rstrip() + "\n"
-
-    case_md: list[str] = []
-    case_md.append("# Auto-Generated Case Studies\n")
-    case_md.append(f"- Generated at: `{out_summary['generated_at']}`")
-    case_md.append(f"- Results dir: `{results_dir}`\n")
-    case_md.append(
-        "This file contains **short excerpt-based case studies** automatically selected from the runs.\n"
-        "It is meant to support qualitative analysis without pasting full transcripts.\n"
-    )
-    case_md.append("")
-    case_md.append(md_case("AIME25: Judge Rescues", examples.get("aime25", [])[:6]))
-    case_md.append(md_case("AIME25: Judge Harms", examples.get("aime25_judge_harm", [])[:6]))
-    case_md.append(md_case("AIME25: Unanimous-Wrong Finals", examples.get("aime25_unanimous_wrong", [])[:6]))
-    case_md.append(md_case("AIME25: Lost-Correct (Correct Appears Then Disappears)", examples.get("aime25_lost_correct", [])[:6]))
-    case_md.append(md_case("GPQA: Judge Rescues", examples.get("gpqa", [])[:6]))
-    case_md.append(md_case("GPQA: Judge Harms", examples.get("gpqa_judge_harm", [])[:6]))
-    case_md.append(md_case("GPQA: Unanimous-Wrong Finals", examples.get("gpqa_unanimous_wrong", [])[:6]))
-    case_md.append(md_case("GPQA: Lost-Correct (Correct Appears Then Disappears)", examples.get("gpqa_lost_correct", [])[:6]))
-    with open(out_dir / "case_studies.md", "w", encoding="utf-8") as f:
-        f.write("\n".join(case_md).rstrip() + "\n")
-
-    append_findings_md(
-        "### Qualitative Case Studies Generated\n\n"
-        + f"- Wrote: `{out_dir / 'case_studies.md'}`\n"
-        + f"- Wrote: `{out_dir / 'examples.json'}`\n"
-    )
+    # Narrative case-study output was intentionally removed.
 
 
 def main() -> None:
@@ -1317,10 +1209,10 @@ def main() -> None:
     ap.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     args = ap.parse_args()
 
-    analyze(Path(args.results_dir), Path(args.out_dir))
-    print(f"Wrote: {DEFAULT_OUT_DIR / 'summary.json'}")
-    print(f"Wrote: {DEFAULT_OUT_DIR / 'tables.md'}")
-    print(f"Appended findings: {FINDINGS_LOG}")
+    out_dir = Path(args.out_dir)
+    analyze(Path(args.results_dir), out_dir)
+    print(f"Wrote: {out_dir / 'summary.json'}")
+    print(f"Wrote: {out_dir / 'tables.md'}")
 
 
 if __name__ == "__main__":

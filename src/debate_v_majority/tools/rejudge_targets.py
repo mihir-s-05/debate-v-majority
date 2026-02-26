@@ -11,46 +11,26 @@ import json
 import os
 import re
 import shutil
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
-if __package__ in (None, ""):
-    import importlib.util
-
-    _PKG_NAME = "debug_majority_debate"
-    _PKG_DIR = Path(__file__).resolve().parent
-    _INIT = _PKG_DIR / "__init__.py"
-    if _PKG_NAME not in sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            _PKG_NAME,
-            str(_INIT),
-            submodule_search_locations=[str(_PKG_DIR)],
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Could not create package spec for {_PKG_DIR}")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[_PKG_NAME] = mod
-        spec.loader.exec_module(mod)
-    __package__ = _PKG_NAME
-
-from . import DatasetName
-from .cli import (
+from .. import DatasetName
+from ..cli import (
     JudgeParseResult,
     JUDGE_RETRY_NUDGE,
     _build_judge_context,
     _check_answer_correctness,
     _parse_judge_output,
 )
-from .engines import (
+from ..engines import (
     SamplingConfig,
     build_sampling_config,
     create_inference_engine,
     set_sampling_config,
 )
-from .shared import (
+from ..shared import (
     PromptTokenCounter,
     render_agent_assistant_rounds,
     strip_thinking_content,
@@ -65,6 +45,7 @@ _JUDGE_EXTRACT_FINAL_NUDGE_BY_DATASET: dict[str, str] = {
     "aime25": (
         "You are given prior judge output that may be verbose or truncated.\n"
         "Output ONLY one final integer answer in this exact format: \\boxed{N} where N is an integer from 0 to 999.\n"
+        "N must be within 0..999. If a computed value is outside this range, convert it modulo 1000 first.\n"
         "Do not output any other text."
     ),
     "gsm8k": (
@@ -81,8 +62,16 @@ def _get_extract_nudge(dataset: DatasetName) -> str:
 
 
 _RETRY_STRONGER_NUDGE_BY_DATASET: dict[str, str] = {
-    "gpqa": "\nReturn exactly one final choice in this format only: \\boxed{A}.",
-    "aime25": "\nReturn exactly one final integer answer in this format only: \\boxed{N} where N is 0..999.",
+    "gpqa": (
+        "\nReturn exactly one final choice in this format only: \\boxed{A}."
+        " Output only that boxed choice and nothing else."
+    ),
+    "aime25": (
+        "\nReturn exactly one final integer answer in this format only: \\boxed{N} where N is 0..999."
+        " Output only that boxed integer and nothing else."
+        " If your computed value is outside 0..999, reduce it modulo 1000 first."
+        " Example: if it is 1524, output \\boxed{524}."
+    ),
     "gsm8k": "\nReturn exactly one final numeric answer in this format only: \\boxed{N}.",
 }
 

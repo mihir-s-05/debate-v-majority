@@ -21,7 +21,7 @@ from typing import Any, Iterable, Literal, TextIO, cast
 
 from tqdm import tqdm
 
-from . import DatasetName, Mode
+from .. import DatasetName, Mode
 
 
 class _DoubleCtrlCHandler:
@@ -64,7 +64,7 @@ class _DoubleCtrlCHandler:
         return False
 
 
-from .shared import (
+from ..shared import (
     most_frequent_answer,
     render_agent_assistant_rounds,
     assistant_message_indexes,
@@ -80,7 +80,7 @@ from .shared import (
     normalize_numeric_string,
     parse_math,
 )
-from .engines import (
+from ..engines import (
     InferenceEngine,
     build_sampling_config,
     set_sampling_config,
@@ -169,13 +169,13 @@ class _QuietOutput:
 def _get_dataset_module(dataset: DatasetName):
     """Lazily import dataset-specific module."""
     if dataset == "gsm8k":
-        from . import gsm8k
+        from ..datasets import gsm8k
         return gsm8k
     elif dataset == "gpqa":
-        from . import gpqa
+        from ..datasets import gpqa
         return gpqa
     elif dataset == "aime25":
-        from . import aime25
+        from ..datasets import aime25
         return aime25
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
@@ -275,9 +275,25 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _dataset_test_path_candidates(dataset: DatasetName, *, source_file: Path | None = None) -> list[Path]:
+    source = source_file or Path(__file__).resolve()
+    repo_root = source.parents[3]
+    package_root = source.parents[1]
+    legacy_cli_root = source.parent
+    # order matters: repo data first, then packaged fallback, then legacy cli/data fallback
+    return [
+        repo_root / "data" / dataset / "test.jsonl",
+        package_root / "data" / dataset / "test.jsonl",
+        legacy_cli_root / "data" / dataset / "test.jsonl",
+    ]
+
+
 def _default_dataset_test_path(dataset: DatasetName) -> Path:
-    """Get default test dataset path."""
-    return Path(__file__).resolve().parent / "data" / dataset / "test.jsonl"
+    candidates = _dataset_test_path_candidates(dataset)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _ensure_dataset_test_jsonl(dataset: DatasetName, test_path: Path) -> None:
@@ -770,7 +786,7 @@ def run_debate(
         if judge_sampling_kwargs and "max_tokens" in judge_sampling_kwargs:
             judge_max_new_tokens = int(judge_sampling_kwargs["max_tokens"])
         else:
-            from .engines import get_sampling_config
+            from ..engines import get_sampling_config
             sampling_cfg = get_sampling_config()
             judge_max_new_tokens = sampling_cfg.max_tokens or 4096
 
@@ -1092,8 +1108,7 @@ def _default_out_dir(dataset: DatasetName) -> Path:
 
 
 
-def main() -> None:
-    """Main CLI entry point."""
+def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Run multi-agent debate, majority voting, or single-response inference on GSM8K/AIME25/GPQA."
     )
@@ -1196,6 +1211,12 @@ def main() -> None:
     ap.add_argument("--out_dir", type=str, default=None, help="Output directory.")
     ap.add_argument("--tag", type=str, default=None, help="Optional tag for output files.")
 
+    return ap
+
+
+def main() -> None:
+    """Main CLI entry point."""
+    ap = _build_arg_parser()
     args = ap.parse_args()
 
     with _QuietOutput(bool(args.quiet)) as q:

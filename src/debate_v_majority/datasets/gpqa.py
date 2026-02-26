@@ -8,7 +8,7 @@ import random
 import re
 from typing import Any
 
-from .shared import parse_math, normalize_freeform_string
+from ..shared import parse_math, normalize_freeform_string
 
 
 # =============================================================================

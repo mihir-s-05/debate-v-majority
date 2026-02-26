@@ -1,66 +1,70 @@
-# debug_majority_debate
+# debate-v-majority
 
-Evaluation harness for comparing LLM inference strategies on math and reasoning benchmarks.
+`debate-v-majority` is an experiment harness for comparing LLM inference strategies on reasoning benchmarks, with emphasis on reproducible runs and auditable outputs.
 
-## Modes
+## What It Runs
 
-- **single** – one completion per question
-- **majority** – generate N samples, return most frequent answer
-- **debate** – multi-agent debate where models critique and refine answers over multiple rounds
+- `single`: one generation per question
+- `majority`: sample multiple generations and pick the majority answer
+- `debate`: multi-agent, multi-round debate with a final judge step
 
-## Datasets Supported
+Supported datasets: GSM8K, AIME25, GPQA.
 
-GSM8K, AIME25, GPQA
+## Repository Layout
 
-## Structure
-
-```
-cli.py       # CLI interface, evaluation loop
-engines.py   # vLLM inference backend
-shared.py    # answer extraction, voting, prompt utilities
-gsm8k.py / aime25.py / gpqa.py  # dataset loaders + answer checking
-data/        # dataset files (auto-downloaded if missing)
+```text
+src/debate_v_majority/cli/      CLI entry and run orchestration
+src/debate_v_majority/engines/  vLLM backend and runtime config
+src/debate_v_majority/shared/   parsing, normalization, and utilities
+src/debate_v_majority/datasets/ dataset loaders/adapters
+src/debate_v_majority/tools/    rejudge + analysis tooling
+scripts/                        script entrypoints
+tests/                          unit tests
+data/                           dataset files
+results/                        run outputs
 ```
 
 ## Setup
 
-Requires Python 3.10+ and a vLLM-compatible GPU environment.
+Python 3.10+ and a vLLM-compatible GPU environment are expected.
 
 ```bash
-pip install -r requirements.txt   # or: pip install vllm==0.13.0
+pip install -e .
+pip install -e .[dev]
 ```
 
-**CUDA note:** The vLLM pip wheel bundles a CUDA 12 runtime (`libcudart.so.12`), but it isn't on the default library search path. If you see `ImportError: libcudart.so.12: cannot open shared object file`, add the bundled library to `LD_LIBRARY_PATH`:
+If CUDA shared libraries are not found, add your CUDA runtime path to `LD_LIBRARY_PATH`.
+
+## Quick Usage
 
 ```bash
-export LD_LIBRARY_PATH="$HOME/venvs/ma/lib/python3.10/site-packages/nvidia/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-```
+# majority vote on a small gsm8k subset
+scripts/debate-v-majority \
+  --dataset gsm8k \
+  --mode majority \
+  --subset_n 5 \
+  --model_name Qwen/Qwen3-8B
 
-Add this to your `~/.bashrc` to make it permanent.
-
-## Usage
-
-```bash
-python -m debug_majority_debate --dataset gsm8k --mode majority --n 5
-
-python -m debug_majority_debate --dataset gpqa --mode debate --rounds 3
-```
-
-## Targeted Judge Repair
-
-Use `rejudge_targets.py` to fix specific debate rows (by `orig_id`) in existing JSONL result files.
-
-```bash
-python rejudge_targets.py \
+# debate mode on gpqa
+scripts/debate-v-majority \
   --dataset gpqa \
-  --target "../results/gpqa_quick/debate_gpqa_agents3_r3_n448_seed1105751790_all_20260207_211326_Qwen_Qwen3-32B.jsonl:115" \
-  --target "../results/gpqa_quick/debate_gpqa_agents3_r3_n448_seed1105751790_all_20260207_211326_Qwen_Qwen3-32B.jsonl:281" \
-  --dry_run
+  --mode debate \
+  --n_rounds 3 \
+  --model_name Qwen/Qwen3-8B
 ```
 
-Behavior:
-- reparses existing `judge_trace` outputs first with strict boxed-final parsing, then conservative recovery parsing
-- reruns judge only when reparsing still cannot recover a valid answer
-- retry pass is deterministic (`temperature=0`, `top_p=1`, capped `max_tokens`) and uses the same nudge prompt as debate mode
-- writes parse provenance into `judge_trace` (`judge_parse_mode`, `judge_parse_source`, retry reason, strict-final flags)
-- rewrites only targeted rows in-place (creates `.bak.<timestamp>` backups unless `--no_backup`)
+## Utilities
+
+```bash
+# targeted judge repair
+scripts/rejudge-targets --help
+
+# aggregate analysis
+scripts/analyze-results --results-dir results --out-dir _autogen
+```
+
+## Testing
+
+```bash
+pytest -q
+```

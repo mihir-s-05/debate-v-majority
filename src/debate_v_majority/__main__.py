@@ -1,7 +1,7 @@
 """
 Entry point for running the package as a module.
 
-Usage: python -m multiagent_debate.debug_majority_debate [args]
+Usage: python -m debate_v_majority [args]
 """
 from .cli import main
 

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
 
-from .shared import (
+from ..shared import (
     is_cuda_oom,
     is_cuda_device_side_assert,
     is_vllm_engine_dead,
@@ -32,9 +32,6 @@ from .shared import (
 )
 
 
-# =============================================================================
-# Sampling configuration
-# =============================================================================
 
 
 @dataclass
@@ -54,7 +51,6 @@ class SamplingConfig:
         }
 
 
-# Global sampling config
 _SAMPLING_CONFIG: SamplingConfig = SamplingConfig()
 
 
@@ -114,9 +110,6 @@ def set_sampling_config(config: SamplingConfig) -> None:
     _SAMPLING_CONFIG = config
 
 
-# =============================================================================
-# Context length and model configuration
-# =============================================================================
 
 
 @lru_cache(maxsize=32)
@@ -147,7 +140,6 @@ def infer_native_context_len(model_name: str) -> int | None:
         if isinstance(v, int) and 0 < v <= 1_000_000:
             candidates.append(v)
 
-    # Check for RoPE scaling
     rope = getattr(cfg, "rope_scaling", None)
     if isinstance(rope, dict):
         base = rope.get("original_max_position_embeddings")
@@ -202,7 +194,6 @@ def build_rope_scaling_overrides(
         if cfg_local is None:
             return overrides
 
-        # Common names across HF configs.
         for key in (
             "max_position_embeddings",
             "n_positions",
@@ -281,9 +272,6 @@ def build_rope_scaling_overrides(
     return None
 
 
-# =============================================================================
-# vLLM helpers
-# =============================================================================
 
 
 def _prepend_ld_library_path(path: str) -> None:
@@ -304,7 +292,6 @@ def _sanitize_flash_attn_env_for_device(*, verbose: bool = False) -> None:
         if not torch.cuda.is_available():
             return
         major, minor = torch.cuda.get_device_capability()
-        # FA3 requires compute capability >= 9.0 (Hopper)
         if major < 9 and os.environ.get("VLLM_FLASH_ATTN_VERSION") == "3":
             if verbose:
                 print(f"[flash] GPU compute capability {major}.{minor} < 9.0; forcing VLLM_FLASH_ATTN_VERSION=2", file=sys.stderr)
@@ -324,7 +311,6 @@ def _resolve_kv_cache_dtype(requested: str | None) -> tuple[str, str | None]:
         if not torch.cuda.is_available():
             return "auto", "CUDA not available"
         major, minor = torch.cuda.get_device_capability()
-        # FP8 KV cache needs compute capability >= 8.9 (Ada/Hopper)
         if major < 8 or (major == 8 and minor < 9):
             return "auto", f"GPU compute capability {major}.{minor} < 8.9; fp8 KV cache requires Ada/Hopper+"
     except Exception as e:
@@ -340,15 +326,13 @@ def _prepare_vllm_runtime_linking() -> None:
     vLLM wheels can depend on shared libraries (e.g. libcudart.so.12, libtorch.so)
     that are not on the default loader path.
     """
-    # Safer than fork with CUDA.
+    # spawn here; fork + cuda child init is brittle
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
-    # Reduce fragmentation / improve allocator stability in long-running inference loops.
     os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", os.environ["PYTORCH_ALLOC_CONF"])
 
-    # torch/lib (libtorch.so, libc10.so, etc.)
     try:
         import torch  # noqa: F401
         torch_lib = str(Path(torch.__file__).resolve().parent / "lib")
@@ -356,7 +340,6 @@ def _prepare_vllm_runtime_linking() -> None:
     except Exception:
         pass
 
-    # pip CUDA runtime (libcudart.so.12) when installed as a Python package.
     try:
         import nvidia.cuda_runtime  # type: ignore
         cuda_rt_lib = str(Path(nvidia.cuda_runtime.__file__).resolve().parent / "lib")
@@ -371,7 +354,6 @@ def _prepare_vllm_runtime_linking() -> None:
         except OSError:
             return False
 
-    # Load libcudart by absolute path if available (LD_LIBRARY_PATH updates may not apply mid-process).
     try:
         import nvidia.cuda_runtime  # type: ignore
         cuda_rt_lib = Path(nvidia.cuda_runtime.__file__).resolve().parent / "lib"
@@ -381,10 +363,8 @@ def _prepare_vllm_runtime_linking() -> None:
     except Exception:
         pass
 
-    # As a fallback, try generic loader search.
     _load_global("libcudart.so.12")
 
-    # Ensure libtorch deps are globally visible for vLLM's native extensions.
     try:
         import torch
         torch_lib_dir = Path(torch.__file__).resolve().parent / "lib"
@@ -437,9 +417,6 @@ def require_vllm_deps() -> None:
         raise RuntimeError(f"CUDA setup issue: {e}") from e
 
 
-# =============================================================================
-# Batch size cache for OOM recovery
-# =============================================================================
 
 
 class BatchSizeCache:
@@ -462,8 +439,6 @@ class BatchSizeCache:
     MAX_PROBE_INTERVAL: int = 10  # Don't wait too long
 
     def __init__(self) -> None:
-        # Only set when we hit an OOM-like failure and back off. When None, we start each
-        # call at the caller-provided cap (or full size).
         self.safe_batch_size: int | None = None
         self.success_count: int = 0
         self.consecutive_probe_successes: int = 0
@@ -476,8 +451,6 @@ class BatchSizeCache:
         return cls._instance
 
     def record_success(self, bs: int) -> None:
-        # Do not update safe_batch_size on success: success at a small batch may simply
-        # reflect a small workload, not a hardware limit.
         self.success_count += 1
 
     def record_probe_success(self, new_safe_bs: int) -> None:
@@ -494,12 +467,10 @@ class BatchSizeCache:
 
     def _get_probe_interval(self) -> int:
         """Get dynamic probe interval based on history."""
-        # After consecutive successful probes, reduce interval
         if self.consecutive_probe_successes >= 3:
             return self.MIN_PROBE_INTERVAL
         if self.consecutive_probe_successes >= 1:
             return self.MIN_PROBE_INTERVAL + 1
-        # After multiple OOMs, be more conservative
         if self.oom_count >= 3:
             return self.MAX_PROBE_INTERVAL
         return self.MIN_PROBE_INTERVAL + 2
@@ -513,23 +484,16 @@ class BatchSizeCache:
         if self.safe_batch_size is None:
             return max_possible
         
-        # Adaptive step size: larger steps after consecutive successful probes
         if self.consecutive_probe_successes >= 3:
-            # Aggressive: try 50% increase
             step = max(1, self.safe_batch_size // 2)
         elif self.consecutive_probe_successes >= 1:
-            # Moderate: 33% increase
             step = max(1, self.safe_batch_size // 3)
         else:
-            # Conservative: 25% increase
             step = max(1, self.safe_batch_size // 4)
         
         return min(max_possible, self.safe_batch_size + step)
 
 
-# =============================================================================
-# VLLMInferenceEngine
-# =============================================================================
 
 
 class VLLMInferenceEngine:
@@ -557,8 +521,6 @@ class VLLMInferenceEngine:
         self._hf_overrides = hf_overrides
         self._kv_cache_dtype = kv_cache_dtype
         self._enforce_eager = enforce_eager
-        # Optimized defaults for high-throughput, multi-GPU eval workloads.
-        # Keep these internal (avoid proliferating CLI flags).
         self._enable_prefix_caching = True
         self._enable_chunked_prefill = True
 
@@ -620,7 +582,6 @@ class VLLMInferenceEngine:
                     try:
                         self._llm = _make_llm(kv_dtype, llm_kwargs)
                     except TypeError:
-                        # Older vLLM may not support these perf flags.
                         self._llm = _make_llm(kv_dtype, {})
                 except Exception as e:
                     if kv_dtype.lower().startswith("fp8") and _is_kv_cache_dtype_unsupported_error(e):
@@ -628,7 +589,6 @@ class VLLMInferenceEngine:
                     else:
                         raise
 
-                # Use sampling config from model's generation_config
                 sampling_cfg = get_sampling_config()
                 sampling_kwargs: dict[str, Any] = {
                     "max_tokens": sampling_cfg.max_tokens or 4096,
@@ -696,25 +656,18 @@ class VLLMInferenceEngine:
                 print(f"[recover] {reason}; restarting vLLM with safer settings.", file=sys.stderr)
             except Exception:
                 pass
-            # Avoid torch.compile / cudagraph after a device-side assert.
-            # Do NOT force TORCH_SDPA here: some vLLM builds don't register it, and
-            # forcing it can make recovery fail during engine startup.
             cur_backend = os.environ.get("VLLM_ATTENTION_BACKEND") or self._attention_backend
             if not cur_backend:
                 os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
             self._enforce_eager = True
-            # Reduce long-context instability at the cost of throughput.
             self._enable_prefix_caching = False
-            # Some models (e.g., Qwen3) require chunked prefill; disabling it can crash.
             self._enable_chunked_prefill = True
-            # fp8 KV cache can trigger backend-specific issues; fall back to auto.
             try:
                 if str(getattr(self, "_kv_cache_dtype", "")).lower().startswith("fp8"):
                     self._kv_cache_dtype = "auto"
             except Exception:
                 self._kv_cache_dtype = "auto"
 
-            # Drop the current engine instance and reinitialize.
             try:
                 if self._llm is not None:
                     del self._llm
@@ -745,14 +698,12 @@ class VLLMInferenceEngine:
         i = 0
         max_possible = len(contexts) if max_batch_size is None else min(max_batch_size, len(contexts))
 
-        # Start at the caller-provided cap (or full size) unless we previously observed an OOM.
         current_bs = min(cache.safe_batch_size, max_possible) if cache.safe_batch_size else max_possible
         is_probing = False
 
         while i < len(contexts):
             remaining = len(contexts) - i
             
-            # Check if we should probe for a larger batch size
             if cache.should_probe() and not is_probing:
                 probe_bs = cache.get_probe_bs(min(max_possible, remaining))
                 if probe_bs > current_bs:
@@ -766,7 +717,6 @@ class VLLMInferenceEngine:
                 chunk_results = _generate_chunk(batch_contexts)
                 out.extend(chunk_results)
                 
-                # If this was a successful probe, record it specially
                 if is_probing and current_bs > (cache.safe_batch_size or 0):
                     cache.record_probe_success(current_bs)
                     is_probing = False
@@ -776,10 +726,8 @@ class VLLMInferenceEngine:
                 if progress_callback is not None:
                     progress_callback(len(chunk_results))
             except Exception as e:
-                # Device-side asserts / illegal memory access can poison the CUDA context; restart vLLM.
                 if is_cuda_device_side_assert(e) or is_vllm_engine_dead(e):
                     _restart_with_safer_runtime(f"{type(e).__name__}: {e}")
-                    # Retry the same chunk at a smaller batch size to reduce stress.
                     current_bs = max(1, current_bs // 2)
                     is_probing = False
                     continue
@@ -806,9 +754,6 @@ class VLLMInferenceEngine:
             gc.collect()
 
 
-# =============================================================================
-# AdaptiveVLLMEngine
-# =============================================================================
 
 
 class AdaptiveVLLMEngine:
@@ -838,7 +783,6 @@ class AdaptiveVLLMEngine:
         self._force_yarn = bool(force_yarn)
         self._kv_cache_dtype = str(kv_cache_dtype)
         self._enforce_eager = bool(enforce_eager)
-        # Keep perf knobs internal; engine defaults are tuned for multi-GPU throughput.
         self._enable_prefix_caching = True
         self._enable_chunked_prefill = True
 
@@ -861,8 +805,6 @@ class AdaptiveVLLMEngine:
         self._engine: VLLMInferenceEngine | None = None
         self._counter = PromptTokenCounter(model_name)
         
-        # Track whether thinking content should be stripped from contexts.
-        # Once set to True, all subsequent contexts will have <think>...</think> stripped.
         self._thinking_stripped: bool = False
 
         native_s = str(self._native_max_model_len) if self._native_max_model_len else "unknown"
@@ -904,7 +846,6 @@ class AdaptiveVLLMEngine:
                 force_yarn=self._force_yarn,
             )
 
-        # Set CUDA_VISIBLE_DEVICES
         os.environ["CUDA_VISIBLE_DEVICES"] = self._gpus
         gpu_count = len(self._gpus.split(","))
 
@@ -947,13 +888,12 @@ class AdaptiveVLLMEngine:
         if self._current_max_model_len >= self._upgrade_cap:
             return
 
-        # Account for max_tokens when computing effective limit to avoid position overflow
+        # hold room for generation; prompt-only fit check is not enough
         max_new_tokens = 4096  # default
         if self._engine is not None and self._engine._sampling_params is not None:
             max_new_tokens = getattr(self._engine._sampling_params, "max_tokens", 4096) or 4096
         effective_limit = max(1, self._current_max_model_len - max_new_tokens)
         near_limit = int(effective_limit * 0.92)
-        # Use exact token counting when within 80% of effective limit to avoid underestimation
         exact_if_large = int(effective_limit * 0.80)
 
         max_prompt = 0
@@ -965,7 +905,6 @@ class AdaptiveVLLMEngine:
                 break
 
         if max_prompt >= near_limit:
-            # Target should account for prompt + max_new_tokens
             target = max(self._current_max_model_len * 2, int((max_prompt + max_new_tokens) * 1.1))
             target = int((target + 255) // 256 * 256)  # Round to 256
             if target <= self._upgrade_cap:
@@ -989,18 +928,14 @@ class AdaptiveVLLMEngine:
         if not contexts:
             return contexts, False, token_estimates
         
-        # If already stripped, just apply stripping to any new content
         if self._thinking_stripped:
             stripped, num_changed = strip_thinking_from_contexts(contexts)
-            # Invalidate estimates if content changed
             return stripped, False, None if num_changed > 0 else token_estimates
         
-        # Check if any context exceeds the threshold
         max_prompt_tokens = max(1, self._current_max_model_len - 128)
         strip_threshold = int(max_prompt_tokens * THINKING_STRIP_THRESHOLD)
         exact_if_large = int(strip_threshold * 0.75)
         
-        # Compute token estimates if not provided
         if token_estimates is None:
             token_estimates = [
                 self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
@@ -1012,7 +947,6 @@ class AdaptiveVLLMEngine:
         if not needs_strip:
             return contexts, False, token_estimates
         
-        # Strip thinking from all contexts
         stripped, num_changed = strip_thinking_from_contexts(contexts)
         if num_changed > 0:
             self.mark_thinking_stripped()
@@ -1021,7 +955,6 @@ class AdaptiveVLLMEngine:
                 f"(threshold: {strip_threshold} tokens).",
                 file=sys.stderr,
             )
-        # Invalidate estimates since content changed
         return stripped, num_changed > 0, None
 
     def _truncate_contexts_to_fit(self, contexts: list[list[dict[str, str]]]) -> list[list[dict[str, str]]]:
@@ -1033,18 +966,15 @@ class AdaptiveVLLMEngine:
         near = int(max_prompt_tokens * 0.92)
         exact_if_large = int(near * 0.75)
 
-        # Compute token estimates once
         token_estimates = [
             self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
             for ctx in contexts
         ]
 
-        # Try stripping thinking content if we're approaching the limit, reuse estimates
         contexts, did_strip, token_estimates = self._maybe_strip_thinking_for_contexts(
             contexts, token_estimates
         )
 
-        # Re-estimate only if stripping invalidated our estimates
         if token_estimates is None:
             token_estimates = [
                 self._counter.estimate_prompt_tokens(ctx, exact_if_large=exact_if_large)
@@ -1090,7 +1020,6 @@ class AdaptiveVLLMEngine:
         if not contexts:
             return []
 
-        # Strip thinking and truncate to fit - no context length upgrades
         contexts = self._truncate_contexts_to_fit(contexts)
 
         assert self._engine is not None
@@ -1101,7 +1030,6 @@ class AdaptiveVLLMEngine:
             )
         except Exception as e:
             if is_prompt_too_long(e):
-                # Try truncating again (more aggressively if needed)
                 truncated = self._truncate_contexts_to_fit(contexts)
                 if truncated != contexts:
                     return self._engine.generate_batch(
@@ -1111,7 +1039,6 @@ class AdaptiveVLLMEngine:
             raise
 
 
-# Type alias for any inference engine
 InferenceEngine = VLLMInferenceEngine | AdaptiveVLLMEngine
 
 
@@ -1132,8 +1059,6 @@ def create_inference_engine(
     """
     require_vllm_deps()
 
-    # Default to fp8 KV cache when the GPU supports it (2x KV memory savings on Ada/Hopper),
-    # but keep a clean interface (no extra flags required).
     kv_req = (kv_cache_dtype or "").strip() or "auto"
     if kv_req.lower() == "auto":
         try:
@@ -1146,7 +1071,6 @@ def create_inference_engine(
             pass
 
     if max_model_len is None:
-        # Use adaptive engine (defaults to tensor parallel across all visible GPUs).
         return AdaptiveVLLMEngine(
             model_name=model_name,
             gpus=gpus,
@@ -1159,7 +1083,6 @@ def create_inference_engine(
             enforce_eager=enforce_eager,
         )
     else:
-        # Use fixed context engine
         os.environ["CUDA_VISIBLE_DEVICES"] = gpus
         gpu_count = len(gpus.split(","))
 
